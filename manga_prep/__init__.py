@@ -1,0 +1,1 @@
+﻿"""MaNGA data preparation package."""

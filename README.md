@@ -2,7 +2,7 @@
 
 Python launchers (in this folder) call `manga_prep.*` for downloads and cutouts. Every script supports **`--help`** for the authoritative option list; the sections below mirror that output.
 
-**Typical order:** MaNGA FITS → SDSS cutouts → Legacy cutouts (Sky Viewer or NERSC coadd) → inventory.
+**Typical order:** MaNGA FITS (or Pipe3D-only) → SDSS cutouts → Legacy cutouts (Sky Viewer or NERSC coadd) → inventory.
 
 ---
 
@@ -43,6 +43,46 @@ options:
   --no-pipe3d-vac       Do not download per-galaxy Pipe3D VAC file (manga-
                         PLATE-IFU.Pipe3D.cube.fits.gz).
   --dry-run             Print URLs only
+```
+
+---
+
+## `download_pipe3d_only.py`
+
+Download **only Pipe3D VAC cubes** for your existing local MaNGA folders.
+
+- With no `plateifu` arguments, it scans `manga_sdss_fits/<plate>_<ifu>/` and downloads:
+  - `manga-PLATE-IFU.Pipe3D.cube.fits.gz`
+- **Skips existing files by default** (safe to re-run).
+- Use `--workers` for parallel downloads.
+
+```bash
+python download_pipe3d_only.py --dry-run
+python download_pipe3d_only.py --workers 16
+python download_pipe3d_only.py 7443-3703 7495-3702 --workers 8
+python download_pipe3d_only.py --no-skip-existing --workers 8
+python download_pipe3d_only.py --help
+```
+
+```
+usage: download_pipe3d_only.py [-h] [--data-root DATA_ROOT]
+                               [--workers WORKERS] [--dry-run]
+                               [--no-skip-existing]
+                               [plateifu ...]
+
+Download only MaNGA Pipe3D VAC cubes. If no plateifu are passed, read targets
+from <data-root>/<plate>_<ifu>/.
+
+positional arguments:
+  plateifu              Optional plate-ifu IDs, e.g. 8485-1901. If omitted,
+                        uses data-root folders.
+
+options:
+  -h, --help            show this help message and exit
+  --data-root DATA_ROOT
+  --workers WORKERS     Parallel download workers across galaxies (default: 8)
+  --dry-run             Print URLs/paths only
+  --no-skip-existing    Re-download even when local Pipe3D file already exists
 ```
 
 ---

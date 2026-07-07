@@ -1,0 +1,10 @@
+# Pip fallbacks only — prefer conda:  conda env create -f environment.yml
+#
+# Use this file only if a package is missing from conda-forge/pytorch for your
+# platform, or to add optional extras. Do NOT pip-install torch if you already
+# have the conda CUDA build (causes OpenMP / libiomp5 conflicts).
+#
+# Example optional extras:
+#   pip install -r requirements.txt
+
+# (no required pip packages for the core MaNGA pipeline)

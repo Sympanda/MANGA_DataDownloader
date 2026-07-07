@@ -1,0 +1,199 @@
+{
+  // =============================================================================
+  // MaNGA map prediction — master training config (JSONC: // comments allowed)
+  // Run:  python runner.py --config config.jsonc --run-name exp_001 --autoinc
+  // =============================================================================
+
+  "training": {
+    // Device: "cuda", "cuda:0", "cuda:1", or "cpu". Fails fast if CUDA requested but unavailable.
+    "device": "cuda:1",
+
+    // Random seed for weight init, split reproducibility (split CSV is created separately).
+    "seed": 42,
+
+    // Maximum training epochs (early stopping may finish sooner).
+    "epochs": 200,
+
+    // Automatic mixed precision (fp16) on CUDA. Forward pass runs in fp32 for stability
+    // with raw SDSS flux; mixed_precision currently has little effect (kept for API compat).
+    "mixed_precision": true,
+
+    // Max gradient norm; clips after unscaling the AMP scaler. Set 0 to disable.
+    "grad_clip": 1.0,
+
+    "optimizer": {
+      // AdamW peak learning rate (after warmup; cosine decays toward lr * min_lr_ratio).
+      "lr": 1e-3,
+      // L2 weight decay on all parameters.
+      "weight_decay": 1e-4
+    },
+
+    // Learning-rate schedule (per epoch, applied before each training epoch).
+    //   constant      — fixed lr (legacy behaviour)
+    //   warmup_cosine — linear warmup, then cosine decay to peak_lr * min_lr_ratio
+    "lr_schedule": {
+      "name": "warmup_cosine",
+      "warmup_epochs": 10,
+      "min_lr_ratio": 0.005
+    },
+
+    "batching": {
+      // Training mini-batch size. Reduce if GPU OOM (76×76 maps + 5-band input).
+      "train_batch_size": 32,
+      // Validation / test / eval batch size (can be larger — no backward pass).
+      "eval_batch_size": 64,
+      // DataLoader workers. 0 = tqdm pauses until 1st batch loads in main thread.
+      "num_workers": 4
+    },
+
+    "early_stopping": {
+      // Stop if validation total loss does not improve for this many epochs.
+      "patience": 20,
+      // Patience counting starts here (best.pt still tracked from epoch 1).
+      // Align with detail_scale_schedule end: warmup_epochs + ramp_epochs.
+      "start_epoch": 50
+    },
+
+    "logging": {
+      // Run root: artifacts go to <root_dir>/<run_name>/
+      "root_dir": "runs/manga_maps",
+      // Save epoch_N.pt checkpoints every N epochs (best.pt always saved on improvement).
+      "save_every_epochs": 5,
+      // Loss curves from csv/train_val_history.csv (written after training ends).
+      "write_plots": true,
+      // Write csv/train_val_history.csv and per-split metrics CSVs.
+      "write_csv_history": true,
+      // Snapshot this config to config_used.json in the run folder.
+      "save_config_snapshot": true,
+      // Max galaxies to plot per eval split (train uses min(4, this)).
+      "eval_max_plot": 8,
+      // Post-train map PNGs + metrics CSVs. Omit "train" unless you want ~8k forward passes.
+      "eval_splits": ["val", "test"],
+      "run_post_train_eval": true
+    }
+  },
+
+  // -----------------------------------------------------------------------------
+  // Data — paths, modalities, augmentations, train/val/test split CSV
+  // -----------------------------------------------------------------------------
+  "data": {
+    // Per-galaxy data tree: manga_sdss_fits/<plate>_<ifu>/
+    "data_root": "manga_sdss_fits",
+
+    // Optional override; default is <data_root>/manga_dataset_index.csv
+  // "index_path": "manga_sdss_fits/manga_dataset_index.csv",
+
+    // Input modalities (at least one spatial source required).
+    "use_sdss": true,           // 5-band ugriz cutouts
+    "use_legacy": false,        // 4-band Legacy cutouts (optional second imaging stack)
+    "use_spectrum": true,       // 1D spectrum conditioning (FiLM)
+    "use_footprint_mask": true, // Load IFU footprint (model usage set by model.footprint_mode)
+
+    // Imaging resolution fed to the model (must match model.imaging_resolution):
+    //   "aligned" — WCS-reprojected 76×76 cutouts (default, current behaviour)
+    //   "native"  — raw FITS cutouts (~196×196); use with HR spatial pipelines below
+    "imaging_resolution": "aligned",
+
+    // Spectrum source when use_spectrum=true:
+    //   "fake" = MaNGA aperture coadd (fake_sdss_spectra/*.npz) — default, full coverage
+    //   "real" = nearest SDSS fiber (sdss_spectra/*.npz) with optional fallback
+    "spectrum_mode": "fake",
+    "spectrum_fallback": true,  // real mode: fall back to fake if no SDSS fiber
+
+    // If true, drop galaxies missing any requested modality (recommended for training).
+    "require_all": true,
+
+    // Train-only geometric augmentations (same transform applied to all images + target maps).
+    "augmentation": {
+      "enabled": true,
+      "hflip": true,   // random horizontal flip (p below)
+      "vflip": true,   // random vertical flip
+      "rot90": true,   // random 90° rotation (k=1,2,3)
+      "p": 0.5         // probability per transform
+    },
+
+    // Train/val/test split — swap CSV path for ensemble runs with different splits.
+    // Create: python -m src.data.make_splits --config config.jsonc
+    "split": {
+      "split_csv_path": "manga_sdss_fits/splits/default_split.csv",
+      "seed": 42,
+      "train_frac": 0.8,
+      "val_frac": 0.1,
+      "test_frac": 0.1
+    }
+  },
+
+  // -----------------------------------------------------------------------------
+  // Model — UNet / UNet++, FiLM spectrum conditioning, output head, losses
+  // -----------------------------------------------------------------------------
+  "model": {
+    // Backbone: "unet" (standard U-Net) or "unetpp" (nested skip connections).
+    "architecture": "unetpp",
+
+    // Output decoder: "single" (direct maps) or "coarse_fine" (coarse map + residual refinement).
+    "output_head": "coarse_fine",
+
+    // --- Spatial pipeline (swap freely; defaults reproduce the original 76×76 symmetric model) ---
+    // imaging_resolution: "aligned" | "native" — must match data.imaging_resolution
+    // spatial_pipeline:
+    //   "symmetric"   — same grid in/out (76×76 aligned SDSS + optional footprint channel)
+    //   "hr_encoder"  — native HR SDSS encoder -> project to 76×76 -> UNet++/UNet decoder
+    //   "hr_full"     — full backbone on native HR SDSS, output maps resized to 76×76
+    "imaging_resolution": "aligned",
+    "spatial_pipeline": "symmetric",
+    // footprint_mode:
+    //   "spatial_channel" — concat 76×76 footprint as input channel (symmetric only)
+    //   "fusion_concat"   — concat footprint on 76×76 fusion stage (HR pipelines)
+    //   "loss_only"       — footprint not fed to model; still used in masked losses
+    "footprint_mode": "spatial_channel",
+    "target_spatial_size": 76,     // Amara / Pipe3D map grid (keep at 76)
+    "hr_project_mode": "bilinear", // "bilinear" | "learned" — HR encoder -> target grid projector
+    // Clip raw SDSS/Legacy flux before the network (prevents AMP fp16 overflow on bright outliers).
+    "imaging_clamp_min": -5.0,
+    "imaging_clamp_max": 100.0,
+
+    // --- Capacity ---
+    "base_channels": 64,           // Width of first encoder level (76×76 input)
+    "bottleneck_multiplier": 16,   // Deepest channels = base_channels × this (8 or 16)
+    "n_down": 4,                   // Number of downsample stages (76→38→19→10→5)
+    "dropout": 0.1,                // Dropout2d in conv blocks [0, 1)
+    "upsample_mode": "bilinear",   // bilinear | transpose | pixel_shuffle (sub-pixel conv)
+    "norm": "gn",                  // "gn" (GroupNorm) or "bn" (BatchNorm)
+    "residual_blocks": true,       // Residual double-conv blocks (UNet only)
+
+    // Spectrum encoder output dimension (shared cond vector for all FiLM gamma/beta layers).
+    "cond_dim": 64,
+    // Spectrum FiLM injection:
+    //   "bottleneck" — gamma/beta once at deepest encoder features
+    //   "encoder"    — gamma/beta after every encoder level (stem + each downsample)
+    "film_injection": "encoder",
+
+    // --- Coarse/fine head (only when output_head="coarse_fine") ---
+    "coarse_factor": 2,            // Coarse branch spatial downscale factor
+    //"detail_scale_init": 0.5,      // Initial residual scale (learnable parameter)
+    // Optional residual ramp: multiplier applied to detail_scale_init during training
+    "detail_scale_schedule": {
+      "warmup_epochs": 20,
+      "ramp_epochs": 50,
+      "start": 0.0,
+      "end": 1.0
+    },
+
+    // --- Losses (composable; weight 0 = disabled) ---
+    // Supervised (mask-only, per-channel masks [B,C,H,W]):
+    //   charbonnier, l1, mse — pixel losses on valid spaxels only
+    //   grad        — horizontal/vertical finite differences on valid neighbour pairs only
+    //   laplacian   — 3×3 Laplacian where full stencil is valid (use low weight)
+    //   integration — masked spatial-sum consistency on flux map channels
+    // Regularisation (no target outside mask):
+    //   tv_pred     — weak TV on prediction across valid neighbours
+    //   residual_amp, residual_tv — coarse/fine residual branch (coarse_fine head only)
+    // See docs/masked_losses.md for mask topology rules.
+  "losses": ["charbonnier", "grad", "laplacian", "integration", "tv_pred", "residual_tv"],
+  "loss_weights": [1.0, 0.2, 0.1, 0.1, 0.0, 0.0],
+    "loss_params": {
+      "charbonnier": { "eps": 1e-3 },
+      "integration": { "normalize": "mean" }
+    }
+  }
+}

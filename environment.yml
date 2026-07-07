@@ -1,0 +1,45 @@
+# MaNGA ML pipeline — conda-first environment (CUDA 12.4, Python 3.11)
+#
+# First time:
+#   conda env create -f environment.yml
+#
+# Env already exists (update in place):
+#   conda env update -n manga -f environment.yml --prune
+#
+# Start fresh:
+#   conda env remove -n manga -y
+#   conda env create -f environment.yml
+#
+# Or:  .\scripts\setup_manga_env.ps1 -Recreate
+#
+# Verify GPU:
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+
+name: manga
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.11
+
+  # PyTorch (CUDA 12.4) — pytorch channel, pinned CUDA builds (win-64)
+  - pytorch=2.5.1=py3.11_cuda12.4_cudnn9_0
+  - torchvision=0.20.1=py311_cu124
+  - torchaudio=2.5.1=py311_cu124
+  - pytorch-cuda=12.4
+
+  # Scientific / astronomy
+  - numpy
+  - scipy
+  - astropy>=6.0
+  - matplotlib
+  - pillow
+  - reproject
+  - tqdm
+
+  # Notebooks & inventory
+  - pandas
+  - ipykernel
+  - jupyter

@@ -327,6 +327,15 @@ class Trainer:
         return history
 
 
+def _resolve_eval_fn(model):
+    cfg = getattr(model, "config", None)
+    if cfg is not None and getattr(cfg, "output_head", None) == "gaussian":
+        from src.metrics.uncertainty_plots import evaluate_uncertainty_predictions
+
+        return evaluate_uncertainty_predictions
+    return evaluate_map_predictions
+
+
 def run_training(
     model: nn.Module,
     train_cfg: TrainConfig,
@@ -389,6 +398,7 @@ def run_training(
     }
     plots_dir = Path(run_dirs["plots"])
     map_keys = tuple(model.config.target_keys)
+    eval_fn = _resolve_eval_fn(model)
 
     for split in train_cfg.eval_splits:
         if split not in split_loaders:
@@ -396,7 +406,7 @@ def run_training(
             continue
         logger.info(f"Evaluating split={split} ...")
         try:
-            rows = evaluate_map_predictions(
+            rows = eval_fn(
                 model,
                 split_loaders[split],
                 device=trainer.device,

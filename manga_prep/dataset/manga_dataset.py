@@ -34,10 +34,8 @@ SpectrumMode = Literal["real", "fake"] | None
 _SDSS_BANDS = ("u", "g", "r", "i", "z")
 _LEGACY_BANDS = ("g", "r", "i", "z")
 
-# Fixed resampling grid for batched spectrum loading (MaNGA LOGCUBE-like span).
-DEFAULT_SPECTRUM_WAVE_MIN = 3622.0
-DEFAULT_SPECTRUM_WAVE_MAX = 10354.0
-DEFAULT_SPECTRUM_N_WAVE = 4563
+# Fixed canvas for native-resolution cutouts (SDSS ugriz are typically 196×196 or 128×128).
+NATIVE_IMAGING_CANVAS = 196
 
 
 def _load_fits_image(path: Path) -> np.ndarray:
@@ -46,6 +44,67 @@ def _load_fits_image(path: Path) -> np.ndarray:
     if data.ndim != 2:
         raise ValueError(f"Expected 2D image in {path}, got shape {data.shape}")
     return data
+
+
+DEFAULT_SPECTRUM_WAVE_MIN = 3622.0
+DEFAULT_SPECTRUM_WAVE_MAX = 10354.0
+DEFAULT_SPECTRUM_N_WAVE = 4563
+
+
+def _center_crop_2d(image: np.ndarray, crop_h: int, crop_w: int) -> np.ndarray:
+    """Center-crop a 2D array to ``(crop_h, crop_w)``."""
+    h, w = image.shape
+    if h == crop_h and w == crop_w:
+        return image
+    if h < crop_h or w < crop_w:
+        raise ValueError(f"Cannot crop {image.shape} to ({crop_h}, {crop_w})")
+    y0 = (h - crop_h) // 2
+    x0 = (w - crop_w) // 2
+    return image[y0 : y0 + crop_h, x0 : x0 + crop_w]
+
+
+def _center_pad_2d(
+    image: np.ndarray,
+    target_h: int,
+    target_w: int,
+    *,
+    pad_value: float = 0.0,
+) -> np.ndarray:
+    """Center-pad or center-crop a 2D array to ``(target_h, target_w)``."""
+    h, w = image.shape
+    if h > target_h or w > target_w:
+        return _center_crop_2d(image, target_h, target_w)
+    if h == target_h and w == target_w:
+        return image
+    out = np.full((target_h, target_w), pad_value, dtype=image.dtype)
+    y0 = (target_h - h) // 2
+    x0 = (target_w - w) // 2
+    out[y0 : y0 + h, x0 : x0 + w] = image
+    return out
+
+
+def _stack_native_imaging_bands(
+    paths: list[Path],
+    *,
+    canvas: int = NATIVE_IMAGING_CANVAS,
+) -> np.ndarray:
+    """
+    Load native FITS cutouts, align band shapes, and pad to a fixed square canvas.
+
+    Some galaxies have mixed 128×128 / 196×196 band downloads; we center-crop all
+    bands to the smallest common shape, then center-pad to ``canvas`` for batching.
+    """
+    bands = [_load_fits_image(path) for path in paths]
+    min_h = min(a.shape[0] for a in bands)
+    min_w = min(a.shape[1] for a in bands)
+    bands = [_center_crop_2d(a, min_h, min_w) for a in bands]
+    stack = np.stack(bands, axis=0)
+    if stack.shape[1] != canvas or stack.shape[2] != canvas:
+        stack = np.stack(
+            [_center_pad_2d(b, canvas, canvas) for b in stack],
+            axis=0,
+        )
+    return stack
 
 
 def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
@@ -239,7 +298,7 @@ class MangaGalaxyDataset(Dataset):
                 axis=0,
             )
         else:
-            stack = np.stack([_load_fits_image(path) for path in paths], axis=0)
+            stack = _stack_native_imaging_bands(paths)
 
         return {"bands": bands, "data": stack, "aligned_to_amara_grid": self.align_imaging_to_amara_grid}
 
@@ -279,10 +338,7 @@ class MangaGalaxyDataset(Dataset):
                         axis=0,
                     )
                 else:
-                    bands_arr = [_load_fits_image(path) for path in paths]
-                    if len({arr.shape for arr in bands_arr}) != 1:
-                        continue
-                    stack = np.stack(bands_arr, axis=0)
+                    stack = _stack_native_imaging_bands(paths)
                 return {
                     "bands": band_set,
                     "data": stack,

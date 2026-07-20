@@ -30,6 +30,7 @@ from manga_prep.export.inventory import main as inventory
 from manga_prep.export.manga_spectra import main as export_manga_spectra
 from manga_prep.export.pipe3d_maps import main as export_pipe3d_maps
 from manga_prep.export.thin_logcube import main as thin_logcube
+from manga_prep.export.validate_sdss_cutouts import main as validate_sdss_cutouts
 from manga_prep.io.ugriz_worker import main as ugriz_worker
 
 
@@ -47,6 +48,7 @@ COMMANDS: dict[str, tuple[Callable, str]] = {
     "export-aligned-imaging": (export_aligned_imaging, "Pre-align SDSS/Legacy to Amara grid"),
     "build-index": (build_index, "Build manga_dataset_index.csv"),
     "inventory": (inventory, "Completeness report for local galaxy folders"),
+    "validate-sdss-cutouts": (validate_sdss_cutouts, "Check ugriz FITS band shape / metadata consistency"),
     "thin-logcube": (thin_logcube, "Strip large FITS, keep LOGCUBE only"),
     "ugriz-worker": (ugriz_worker, "Subprocess worker for ugriz downloads (internal)"),
 }

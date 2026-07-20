@@ -29,6 +29,32 @@ MAX_SECONDS_PER_SAMPLE_UNET = 0.05
 MAX_SECONDS_PER_SAMPLE_ALL = 0.15
 
 
+class NativeImagingStackTests(unittest.TestCase):
+    def test_stack_mixed_band_shapes(self) -> None:
+        from manga_prep.dataset.manga_dataset import _center_crop_2d, _stack_native_imaging_bands
+        from unittest.mock import patch
+
+        bands = {
+            "u": np.ones((196, 196), dtype=np.float32),
+            "g": np.ones((196, 196), dtype=np.float32),
+            "r": np.ones((128, 128), dtype=np.float32),
+            "i": np.ones((196, 196), dtype=np.float32),
+            "z": np.ones((196, 196), dtype=np.float32),
+        }
+        paths = [Path(f"/fake/{b}.fits") for b in ("u", "g", "r", "i", "z")]
+
+        def fake_load(path: Path) -> np.ndarray:
+            band = path.stem.split("-")[-1]
+            return bands[band]
+
+        with patch("manga_prep.dataset.manga_dataset._load_fits_image", side_effect=fake_load):
+            stack = _stack_native_imaging_bands(paths, canvas=196)
+
+        self.assertEqual(stack.shape, (5, 196, 196))
+        cropped_r = _center_crop_2d(bands["r"], 128, 128)
+        np.testing.assert_array_equal(stack[2, 34:162, 34:162], cropped_r)
+
+
 def _ensure_index() -> None:
     if not INDEX_PATH.is_file():
         rows = build_manga_dataset_index(DATA_ROOT)

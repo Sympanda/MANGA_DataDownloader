@@ -86,7 +86,20 @@ def cutouts_fully_complete(
         for b in _UGRIZ:
             paths.append(cut / f"sdss-{plate}-{ifu}-{b}.fits")
     paths.append(cut / "metadata.json")
-    return all(p.exists() and p.stat().st_size > 0 for p in paths)
+    if not all(p.exists() and p.stat().st_size > 0 for p in paths):
+        return False
+    if require_ugriz:
+        meta = load_cutout_metadata(cut / "metadata.json")
+        size_px = meta.get("size_px") if meta else None
+        if size_px is not None:
+            ok, _ = _verify_ugriz_shapes(cut, plate, ifu, int(size_px))
+            if not ok:
+                return False
+        listed = set((meta or {}).get("ugriz_files") or {})
+        for band in _UGRIZ:
+            if band not in listed:
+                return False
+    return True
 
 
 def load_cutout_metadata(meta_path: Path) -> dict | None:
@@ -388,6 +401,68 @@ def _numpy_cutout(
     return out, new_hdr
 
 
+def _ugriz_band_paths(out_dir: Path, plate: str, ifu: str) -> dict[str, Path]:
+    return {b: out_dir / f"sdss-{plate}-{ifu}-{b}.fits" for b in _UGRIZ}
+
+
+def _remove_ugriz_band_files(paths: dict[str, Path], bands: set[str]) -> None:
+    for band in bands:
+        path = paths[band]
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _verify_ugriz_shapes(
+    out_dir: Path,
+    plate: str,
+    ifu: str,
+    size_px: int,
+    *,
+    bands: tuple[str, ...] = _UGRIZ,
+) -> tuple[bool, str]:
+    """All listed bands must exist on disk with shape (size_px, size_px)."""
+    paths = _ugriz_band_paths(out_dir, plate, ifu)
+    shapes: dict[str, tuple[int, int] | None] = {}
+    for band in bands:
+        path = paths[band]
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False, f"missing band {band}"
+        try:
+            header = fits.getheader(path, 0)
+            h = int(header["NAXIS2"])
+            w = int(header["NAXIS1"])
+        except Exception as e:
+            return False, f"bad header for band {band}: {e}"
+        shapes[band] = (h, w)
+        if (h, w) != (int(size_px), int(size_px)):
+            return False, f"band {band} shape {(h, w)} != ({size_px}, {size_px})"
+    if len(set(shapes.values())) != 1:
+        return False, f"mixed band shapes: {shapes}"
+    return True, "ok"
+
+
+def _purge_unlisted_ugriz_bands(
+    out_dir: Path,
+    plate: str,
+    ifu: str,
+    listed_bands: set[str],
+) -> list[str]:
+    """Remove on-disk ugriz FITS not present in the latest download manifest."""
+    removed: list[str] = []
+    for band, path in _ugriz_band_paths(out_dir, plate, ifu).items():
+        if band in listed_bands:
+            continue
+        if path.is_file():
+            try:
+                path.unlink()
+                removed.append(band)
+            except OSError:
+                pass
+    return removed
+
+
 def download_ugriz_fits_cutouts(
     ra: float,
     dec: float,
@@ -627,6 +702,8 @@ def run_cutouts_for_plateifu(
 
     ugriz_files: dict[str, str] = {}
     if not no_ugriz:
+        # Drop leftover band files from partial / mixed-size downloads before fetching.
+        _remove_ugriz_band_files(_ugriz_band_paths(out_dir, plate, ifu), set(_UGRIZ))
         print(
             f"  ugriz: querying SDSS (DR{ugriz_dr}) for {plateifu} — may take a minute…",
             flush=True,
@@ -669,6 +746,18 @@ def run_cutouts_for_plateifu(
             file=sys.stderr,
         )
         return 1
+
+    if not no_ugriz and ugriz_files:
+        removed = _purge_unlisted_ugriz_bands(out_dir, plate, ifu, set(ugriz_files.keys()))
+        if removed:
+            print(f"  removed stale bands not in download manifest: {removed}", flush=True)
+
+        ok_shapes, shape_msg = _verify_ugriz_shapes(out_dir, plate, ifu, size)
+        if not ok_shapes and len(ugriz_files) == len(_UGRIZ):
+            print(f"warning: ugriz shape check failed for {plateifu}: {shape_msg}", file=sys.stderr)
+        if want_strict and not ok_shapes:
+            print(f"error: ugriz shape check failed for {plateifu}: {shape_msg}", file=sys.stderr)
+            return 1
 
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = {

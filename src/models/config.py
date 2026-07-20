@@ -6,7 +6,7 @@ from typing import Literal
 from manga_prep.targets.pipe3d_maps import AMARA_TARGET_KEYS, DEFAULT_TARGET_SIZE
 
 ArchitectureType = Literal["unet", "unetpp"]
-OutputHeadType = Literal["single", "coarse_fine"]
+OutputHeadType = Literal["single", "coarse_fine", "gaussian"]
 FilmInjection = Literal["none", "bottleneck", "encoder"]
 UpsampleMode = Literal["bilinear", "transpose", "pixel_shuffle"]
 ImagingResolution = Literal["aligned", "native"]

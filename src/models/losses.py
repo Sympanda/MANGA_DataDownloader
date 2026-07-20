@@ -204,6 +204,25 @@ def masked_integration_loss(
     return torch.stack(losses).mean()
 
 
+def masked_gaussian_nll(
+    mu: torch.Tensor,
+    log_var: torch.Tensor,
+    target: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    min_log_var: float = -6.0,
+    max_log_var: float = 6.0,
+) -> torch.Tensor:
+    """Masked Gaussian negative log-likelihood per valid spaxel (log_var = log σ²)."""
+    mask = _ensure_bchw(loss_mask, mu)
+    tgt = _safe_target(target, mask)
+    log_var = log_var.clamp(min=min_log_var, max=max_log_var)
+    inv_var = torch.exp(-log_var)
+    sq_err = (mu - tgt) ** 2
+    nll = 0.5 * (log_var + sq_err * inv_var)
+    return _masked_mean(nll, mask)
+
+
 LOSS_REGISTRY: dict[str, Callable] = {
     "charbonnier": masked_charbonnier,
     "l1": masked_l1,
@@ -213,6 +232,7 @@ LOSS_REGISTRY: dict[str, Callable] = {
     "tv_pred": prediction_tv_loss,
     "residual_amp": residual_amplitude_loss,
     "residual_tv": residual_tv_loss,
+    "gaussian_nll": masked_gaussian_nll,
 }
 
 
@@ -227,6 +247,7 @@ def compose_map_losses(
     target_keys: tuple[str, ...],
     integration_channel_keys: tuple[str, ...] = FLUX_INTEGRATION_KEYS,
     residual: torch.Tensor | None = None,
+    log_var: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Compose weighted map losses.
@@ -250,6 +271,16 @@ def compose_map_losses(
                 loss_mask,
                 channel_indices=ch_idx,
                 **params.get("integration", {}),
+            )
+        elif name == "gaussian_nll":
+            if log_var is None:
+                raise ValueError("gaussian_nll requires log_var from a gaussian output head")
+            val = masked_gaussian_nll(
+                pred,
+                log_var,
+                target,
+                loss_mask,
+                **params.get("gaussian_nll", {}),
             )
         elif name in ("tv_pred",):
             val = prediction_tv_loss(pred, loss_mask)

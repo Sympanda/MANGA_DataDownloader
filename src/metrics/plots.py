@@ -87,10 +87,14 @@ def _percentile_norm(x: np.ndarray, lo: float = 5, hi: float = 99) -> np.ndarray
     return np.clip((x - p_lo) / max(p_hi - p_lo, 1e-6), 0, 1)
 
 
+# Shared display limits for 0–1 scaled Pipe3D map targets (see manga_prep.targets.pipe3d_maps).
+# Keep identical across point-estimate and uncertainty eval panels.
 MAP_VMIN = 0.0
 MAP_VMAX = 1.0
-DIFF_VMIN = -0.5
-DIFF_VMAX = 0.5
+DIFF_VMIN = -0.15
+DIFF_VMAX = 0.15
+SIGMA_VMIN = 0.0
+SIGMA_VMAX = 0.15
 
 
 def plot_map_prediction_panel(
@@ -141,7 +145,7 @@ def plot_map_prediction_panel(
         diff = np.where(m, prd - tgt, np.nan)
 
         ax_tgt = fig.add_subplot(gs[row, 1])
-        ax_tgt.imshow(
+        im_tgt = ax_tgt.imshow(
             np.where(m, tgt, np.nan),
             origin="lower",
             cmap="viridis",
@@ -151,9 +155,10 @@ def plot_map_prediction_panel(
         ax_tgt.set_title(f"{key} target")
         ax_tgt.set_xticks([])
         ax_tgt.set_yticks([])
+        fig.colorbar(im_tgt, ax=ax_tgt, fraction=0.046)
 
         ax_pred = fig.add_subplot(gs[row, 2])
-        ax_pred.imshow(
+        im_prd = ax_pred.imshow(
             np.where(m, prd, np.nan),
             origin="lower",
             cmap="viridis",
@@ -163,6 +168,7 @@ def plot_map_prediction_panel(
         ax_pred.set_title(f"{key} pred")
         ax_pred.set_xticks([])
         ax_pred.set_yticks([])
+        fig.colorbar(im_prd, ax=ax_pred, fraction=0.046)
 
         ax_diff = fig.add_subplot(gs[row, 3])
         im_diff = ax_diff.imshow(

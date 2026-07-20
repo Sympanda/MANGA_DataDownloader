@@ -45,7 +45,13 @@ class ConditionalMapModel(nn.Module):
         self.config = config
 
         use_coarse_fine = config.output_head == "coarse_fine"
-        backbone_out = config.base_channels if use_coarse_fine else config.n_target_maps
+        use_gaussian = config.output_head == "gaussian"
+        if use_coarse_fine:
+            backbone_out = config.base_channels
+        elif use_gaussian:
+            backbone_out = 2 * config.n_target_maps
+        else:
+            backbone_out = config.n_target_maps
 
         self.hr_encoder: HREncoder | None = None
         self.grid_projector: GridProjector | None = None
@@ -162,12 +168,21 @@ class ConditionalMapModel(nn.Module):
 
         return self.backbone(x_spatial)
 
+    def _split_gaussian_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        channels = self.config.n_target_maps
+        mu = features[:, :channels]
+        log_var = features[:, channels : 2 * channels]
+        return mu, log_var
+
     def _apply_output_head(
         self,
         features: torch.Tensor,
         *,
         detail_scale_multiplier: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if self.config.output_head == "gaussian":
+            mu, _log_var = self._split_gaussian_features(features)
+            return mu, None, None
         if self.output_head is not None:
             maps, coarse, residual = self.output_head(
                 features,
@@ -185,6 +200,27 @@ class ConditionalMapModel(nn.Module):
         if maps.shape[-2:] == target_size:
             return maps
         return F.interpolate(maps, size=target_size, mode="bilinear", align_corners=False)
+
+    def _finalize_gaussian_output(
+        self,
+        features: torch.Tensor,
+        footprint: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        mu, log_var = self._split_gaussian_features(features)
+        target_size = self._target_size(footprint)
+        maps = self._resize_to_target(mu, footprint)
+        if log_var.shape[-2:] != target_size:
+            log_var = F.interpolate(log_var, size=target_size, mode="bilinear", align_corners=False)
+        # NLL loss treats log_var as log(σ²); σ = exp(½ log_var).
+        log_var_clamped = log_var.clamp(
+            min=self.config.loss_params.get("gaussian_nll", {}).get("min_log_var", -6.0),
+            max=self.config.loss_params.get("gaussian_nll", {}).get("max_log_var", 6.0),
+        )
+        aux = {
+            "log_var": log_var,
+            "sigma": torch.exp(0.5 * log_var_clamped) + 1e-4,
+        }
+        return maps, aux
 
     def forward(
         self,
@@ -207,6 +243,8 @@ class ConditionalMapModel(nn.Module):
             features = F.interpolate(features, size=target_size, mode="bilinear", align_corners=False)
             if self.footprint_fusion is not None and footprint is not None:
                 features = self.footprint_fusion(features, footprint)
+            if self.config.output_head == "gaussian":
+                return self._finalize_gaussian_output(features, footprint)
             maps, coarse, residual = self._apply_output_head(
                 features,
                 detail_scale_multiplier=detail_scale_multiplier,
@@ -216,6 +254,9 @@ class ConditionalMapModel(nn.Module):
             if residual is not None:
                 aux["residual"] = residual
             return maps, aux
+
+        if self.config.output_head == "gaussian":
+            return self._finalize_gaussian_output(features, footprint)
 
         maps, coarse, residual = self._apply_output_head(
             features,

@@ -1,8 +1,7 @@
 {
-  // =============================================================================
-  // MaNGA map prediction — master training config (JSONC: // comments allowed)
-  // Run:  python runner.py --config config.jsonc --run-name exp_001 --autoinc
-  // =============================================================================
+  // Uncertainty (heteroscedastic μ+σ) map model — separate from config.jsonc baseline runs.
+  // Run:  python runner_uncertainty.py --config config_uncertainty.jsonc --run-name unc_v1 --autoinc
+  // Ens:  python runner_ensemble.py --config config_uncertainty.jsonc --ensemble-name ens_v1 --n-models 5
 
   "training": {
     "device": "cuda:1",
@@ -12,26 +11,25 @@
     "grad_clip": 1.0,
 
     "optimizer": {
-      "lr": 1e-3,
+      "lr": 3e-4,
       "weight_decay": 1e-4
     },
 
     "lr_schedule": {
       "name": "warmup_cosine",
-      "warmup_epochs": 10,
+      "warmup_epochs": 5,
       "min_lr_ratio": 0.005
     },
 
     "batching": {
-      "train_batch_size": 32,
-      "eval_batch_size": 64,
+      "train_batch_size": 16,
+      "eval_batch_size": 32,
       "num_workers": 4
     },
 
     "early_stopping": {
-      "patience": 25,
-      // v8 best val was ~epoch 64; start counting non-improvements after warmup.
-      "start_epoch": 40
+      "patience": 20,
+      "start_epoch": 30
     },
 
     "logging": {
@@ -40,7 +38,7 @@
       "write_plots": true,
       "write_csv_history": true,
       "save_config_snapshot": true,
-      "eval_max_plot": 8,
+      "eval_max_plot": 32,
       "eval_splits": ["val", "test"],
       "run_post_train_eval": true
     }
@@ -52,10 +50,7 @@
     "use_legacy": false,
     "use_spectrum": true,
     "use_footprint_mask": true,
-
-    // v10 baseline: aligned 76×76 (same as v8). Native HR deferred until cutouts are cleaned.
     "imaging_resolution": "aligned",
-
     "spectrum_mode": "fake",
     "spectrum_fallback": true,
     "require_all": true,
@@ -79,9 +74,8 @@
 
   "model": {
     "architecture": "unetpp",
-    "output_head": "single",
+    "output_head": "gaussian",
 
-    // --- Spatial pipeline (v8 symmetric baseline) ---
     "imaging_resolution": "aligned",
     "spatial_pipeline": "symmetric",
     "footprint_mode": "spatial_channel",
@@ -102,22 +96,8 @@
     "cond_dim": 64,
     "film_injection": "encoder",
 
-    // --- Coarse/fine head (only when output_head="coarse_fine") ---
-    "coarse_factor": 2,
-    "detail_scale_init": 1.0,
-
-    // --- Losses (composable; weight 0 = disabled) ---
-    // Supervised (mask-only, per-channel masks [B,C,H,W]):
-    //   charbonnier, l1, mse  — pixel losses on valid spaxels only
-    //   grad                  — horizontal/vertical finite differences on valid neighbour pairs
-    //   laplacian             — 3×3 Laplacian where full stencil is valid (use low weight)
-    //   integration           — masked spatial-sum consistency on flux map channels
-    // Regularisation (no target outside mask):
-    //   tv_pred               — weak TV on prediction across valid neighbours
-    //   residual_amp          — L1 on coarse/fine residual branch (coarse_fine head only)
-    //   residual_tv           — pairwise TV on residual branch (coarse_fine head only)
-    // v10: v8 recipe + slightly stronger edge terms (grad/laplacian).
     "losses": [
+      "gaussian_nll",
       "charbonnier",
       "l1",
       "mse",
@@ -128,20 +108,31 @@
       "residual_amp",
       "residual_tv"
     ],
+    // NLL alone can inflate σ to reduce loss; L1 on μ keeps fidelity (v8-style).
+    // Prefer L1 over MSE — MSE is already implicit in NLL when σ is small.
     "loss_weights": [
+      1.0,   // gaussian_nll
       0.0,   // charbonnier
-      1.0,   // l1
+      0.4,   // l1 on μ — fidelity anchor
       0.0,   // mse
-      0.4,   // grad   (v8: 0.35)
-      0.18,  // laplacian (v8: 0.15)
+      0.35,  // grad
+      0.15,  // laplacian
       0.0,   // integration
       0.0,   // tv_pred
       0.0,   // residual_amp
       0.0    // residual_tv
     ],
     "loss_params": {
+      "gaussian_nll": { "min_log_var": -6.0, "max_log_var": 6.0 },
       "charbonnier": { "eps": 1e-3 },
       "integration": { "normalize": "mean" }
     }
+  },
+
+  "ensemble": {
+    "base_split_csv": "manga_sdss_fits/splits/default_split.csv",
+    "member_seed_offset": 1000,
+    "secondary_sigma": "epistemic",
+    "eval_max_plot": 32
   }
 }

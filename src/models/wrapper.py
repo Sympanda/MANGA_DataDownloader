@@ -5,7 +5,14 @@ import torch.nn as nn
 
 from src.models.conditional_unet import ConditionalMapModel
 from src.models.config import ModelConfig, effective_detail_scale_multiplier
-from src.models.losses import compose_map_losses
+from src.models.losses import (
+    compose_map_losses,
+    masked_charbonnier,
+    masked_l1,
+    masked_laplacian_loss,
+    masked_mse,
+    masked_pairwise_grad_loss,
+)
 
 
 def _nan_to_num(t: torch.Tensor) -> torch.Tensor:
@@ -67,6 +74,46 @@ def prepare_targets_and_masks(
     return _nan_to_num(targets), masks
 
 
+_DS_LOSS_FN = {
+    "l1": masked_l1,
+    "mse": masked_mse,
+    "charbonnier": masked_charbonnier,
+    "grad": masked_pairwise_grad_loss,
+    "laplacian": masked_laplacian_loss,
+}
+
+
+def add_deep_supervision_losses(
+    loss_dict: dict[str, torch.Tensor],
+    *,
+    deep_maps: torch.Tensor,
+    targets: torch.Tensor,
+    masks: torch.Tensor,
+    config: ModelConfig,
+) -> dict[str, torch.Tensor]:
+    """
+    Add masked fidelity losses on UNet++ auxiliary DS heads (excludes deepest).
+
+    deep_maps: (L, B, C, H, W) stacked predictions from shallow → deep.
+    Deepest head already carries the full compose_map_losses term.
+    """
+    if deep_maps.ndim != 5 or deep_maps.shape[0] < 2:
+        return loss_dict
+    weights = config.resolved_deep_supervision_weights()
+    loss_fn = _DS_LOSS_FN[config.deep_supervision_loss]
+    total = loss_dict["loss"]
+    n_aux = deep_maps.shape[0] - 1
+    for i in range(n_aux):
+        w = weights[i] if i < len(weights) else 0.0
+        if w <= 0:
+            continue
+        aux_loss = loss_fn(deep_maps[i].float(), targets, masks)
+        loss_dict[f"ds_{i}"] = aux_loss
+        total = total + float(w) * aux_loss
+    loss_dict["loss"] = total
+    return loss_dict
+
+
 class MapGenerator(nn.Module):
     """Wrapper: batch dict -> (pred_dict, loss_dict) for Trainer compatibility."""
 
@@ -104,6 +151,14 @@ class MapGenerator(nn.Module):
             target_keys=self.config.target_keys,
             residual=aux.get("residual"),
         )
+        if self.config.deep_supervision and "deep_maps" in aux:
+            loss_dict = add_deep_supervision_losses(
+                loss_dict,
+                deep_maps=aux["deep_maps"],
+                targets=targets.float(),
+                masks=masks.float(),
+                config=self.config,
+            )
         pred_dict = {"maps": pred_maps, "targets": targets, "masks": masks, **aux}
         return pred_dict, loss_dict
 

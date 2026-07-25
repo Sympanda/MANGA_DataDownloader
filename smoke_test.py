@@ -43,6 +43,7 @@ def main() -> int:
                         film_injection=film,
                         cond_dim=64,
                         upsample_mode="pixel_shuffle",
+                        deep_supervision=False,
                         **spatial,
                     )
                     model = MapGenerator(cfg)
@@ -55,6 +56,29 @@ def main() -> int:
                         f"pipe={spatial['spatial_pipeline']}  res={spatial['imaging_resolution']}  "
                         f"fp={spatial['footprint_mode']}  loss={float(loss['loss']):.4f}"
                     )
+
+    # UNet++ + encoder FiLM + deep supervision (preferred fidelity path)
+    for film in ("bottleneck", "encoder"):
+        cfg = ModelConfig(
+            architecture="unetpp",
+            output_head="single",
+            film_injection=film,
+            cond_dim=64,
+            deep_supervision=True,
+            upsample_mode="transpose",
+            spatial_pipeline="symmetric",
+            imaging_resolution="aligned",
+            footprint_mode="spatial_channel",
+        )
+        model = MapGenerator(cfg)
+        pred, loss = model(_dummy_batch(cfg))
+        assert pred["maps"].shape[-2:] == (76, 76)
+        assert "deep_maps" in pred and pred["deep_maps"].shape[0] == cfg.n_down
+        assert any(k.startswith("ds_") for k in loss)
+        print(
+            f"OK  arch=unetpp  head=single  film={film}  deep_supervision=True  "
+            f"loss={float(loss['loss']):.4f}"
+        )
     return 0
 
 

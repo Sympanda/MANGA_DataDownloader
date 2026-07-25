@@ -52,6 +52,15 @@ class ModelConfig:
     spectrum_n_wave: int = 4563
     film_injection: FilmInjection = "bottleneck"
 
+    # UNet++ deep supervision (Zhou et al.): 1×1 heads on full-res nested nodes.
+    # Preferred over coarse_fine for multi-scale fidelity on this architecture.
+    deep_supervision: bool = False
+    # Per-level weights for auxiliary heads x11…x{L-1}{L-1} (deepest uses full loss).
+    # None → linear ramp (1/L … (L-1)/L). Length must be n_down - 1 when set.
+    deep_supervision_weights: list[float] | None = None
+    # Aux-head loss (full loss stack stays on deepest). Prefer "grad" for sharpness.
+    deep_supervision_loss: Literal["l1", "mse", "charbonnier", "grad", "laplacian"] = "l1"
+
     coarse_factor: int = 2
     detail_scale_init: float = 0.1
     detail_scale_schedule: dict[str, float | int] | None = None
@@ -109,6 +118,31 @@ class ModelConfig:
             )
         if self.footprint_mode == "fusion_concat" and not self.use_footprint_mask:
             raise ValueError("footprint_mode='fusion_concat' requires use_footprint_mask=true")
+        if self.deep_supervision:
+            if self.architecture != "unetpp":
+                raise ValueError("deep_supervision requires architecture='unetpp'")
+            if self.output_head != "single":
+                raise ValueError(
+                    "deep_supervision requires output_head='single' "
+                    "(prefer UNet++ DS over coarse_fine / gaussian heads)."
+                )
+            if self.deep_supervision_weights is not None:
+                expected = self.n_down - 1
+                if len(self.deep_supervision_weights) != expected:
+                    raise ValueError(
+                        f"deep_supervision_weights must have length n_down-1={expected}, "
+                        f"got {len(self.deep_supervision_weights)}"
+                    )
+
+    def resolved_deep_supervision_weights(self) -> list[float]:
+        """Weights for auxiliary DS heads (excludes deepest, which uses the full loss)."""
+        n_aux = self.n_down - 1
+        if n_aux <= 0:
+            return []
+        if self.deep_supervision_weights is not None:
+            return [float(w) for w in self.deep_supervision_weights]
+        depth = self.n_down
+        return [(i + 1) / depth for i in range(n_aux)]
 
 
 def effective_detail_scale_multiplier(

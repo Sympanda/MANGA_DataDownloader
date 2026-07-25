@@ -110,6 +110,13 @@ def build_model_config(
         residual_blocks=bool(model_top.get("residual_blocks", True)),
         cond_dim=int(model_top.get("cond_dim", 384)),
         film_injection=model_top.get("film_injection", "bottleneck"),
+        deep_supervision=bool(model_top.get("deep_supervision", False)),
+        deep_supervision_weights=(
+            [float(w) for w in model_top["deep_supervision_weights"]]
+            if model_top.get("deep_supervision_weights") is not None
+            else None
+        ),
+        deep_supervision_loss=model_top.get("deep_supervision_loss", "l1"),
         coarse_factor=int(model_top.get("coarse_factor", 2)),
         detail_scale_init=float(model_top.get("detail_scale_init", 0.1)),
         detail_scale_schedule=model_top.get("detail_scale_schedule"),
@@ -319,6 +326,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  run          : {run_name}")
     print(f"  train/val/test batches: {len(dl_train)}/{len(dl_val)}/{len(dl_test)}")
     print(f"  architecture : {model_cfg.architecture}  head={model_cfg.output_head}")
+    print(
+        f"  conditioning : film={model_cfg.film_injection}  "
+        f"deep_supervision={model_cfg.deep_supervision}"
+    )
     print(f"  spatial pipe : {model_cfg.spatial_pipeline}  imaging={model_cfg.imaging_resolution}")
     print(f"  footprint    : {model_cfg.footprint_mode}")
     print(f"  inputs       : {_describe_inputs(model_cfg, data_cfg)}")

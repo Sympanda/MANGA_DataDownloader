@@ -102,7 +102,14 @@
     "cond_dim": 64,
     "film_injection": "encoder",
 
-    // --- Coarse/fine head (only when output_head="coarse_fine") ---
+    // UNet++ deep supervision (Zhou et al.) — preferred over coarse_fine for fidelity.
+    // Aux heads on nested full-res nodes x11…x{L-1}{L-1}; deepest uses the full loss stack.
+    "deep_supervision": true,
+    // Milder than 1/L…(L-1)/L so aux structure terms don't swamp the deepest head.
+    "deep_supervision_weights": [0.2, 0.4, 0.6],
+    "deep_supervision_loss": "grad",
+
+    // --- Coarse/fine head (disabled when deep_supervision=true; use output_head="single") ---
     "coarse_factor": 2,
     "detail_scale_init": 1.0,
 
@@ -116,7 +123,9 @@
     //   tv_pred               — weak TV on prediction across valid neighbours
     //   residual_amp          — L1 on coarse/fine residual branch (coarse_fine head only)
     //   residual_tv           — pairwise TV on residual branch (coarse_fine head only)
-    // v10: v8 recipe + slightly stronger edge terms (grad/laplacian).
+    // Deep supervision (UNet++): aux loss via deep_supervision_* (grad preferred for sharpness).
+    // v11 sharpness: stronger grad/laplacian; DS aux uses grad not L1.
+    // Prefer deep_supervision over coarse_fine when architecture=unetpp.
     "losses": [
       "charbonnier",
       "l1",
@@ -132,8 +141,8 @@
       0.0,   // charbonnier
       1.0,   // l1
       0.0,   // mse
-      0.4,   // grad   (v8: 0.35)
-      0.18,  // laplacian (v8: 0.15)
+      1.0,   // grad   (was 0.4)
+      0.4,   // laplacian (was 0.18)
       0.0,   // integration
       0.0,   // tv_pred
       0.0,   // residual_amp

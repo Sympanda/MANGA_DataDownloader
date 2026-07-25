@@ -9,7 +9,9 @@ from src.models.unet import ConvBlock, SpatialUpsample2x, UpsampleMode, nested_u
 class UNetPPBackbone(nn.Module):
     """
     UNet++ style nested skip connections for 76×76 inputs.
-    Dense nodes X_{i,j}: i = depth level, j = nested index.
+
+    Dense nodes X_{i,j}: encoder spine X_{i,0}, nested nodes X_{i,j}.
+    Full-resolution deep-supervision sites are X_{1,1} … X_{L,L} (keys x11…xLL).
     """
 
     def __init__(
@@ -22,6 +24,7 @@ class UNetPPBackbone(nn.Module):
         dropout: float = 0.0,
         upsample_mode: UpsampleMode = "bilinear",
         norm: str = "bn",
+        with_output_conv: bool = True,
     ) -> None:
         super().__init__()
         self.depth = depth
@@ -44,8 +47,14 @@ class UNetPPBackbone(nn.Module):
                 out_ch = c * (2 ** (i - j))
                 self.nested[f"x{i}{j}"] = ConvBlock(in_ch, out_ch, **block_kw)
 
-        self._bottleneck_channels = c  # final nested node X_{L,L} has base_channels
-        self.outc = nn.Conv2d(c, out_channels, kernel_size=1)
+        # True encoder bottleneck X_{L,0} (deepest spine), not the final nested node.
+        self._bottleneck_channels = c * (2**depth)
+        self.with_output_conv = with_output_conv
+        self.outc: nn.Module | None
+        if with_output_conv:
+            self.outc = nn.Conv2d(c, out_channels, kernel_size=1)
+        else:
+            self.outc = None
         self.upsample_mode = upsample_mode
         self.upsamplers = nn.ModuleDict(
             {
@@ -67,58 +76,75 @@ class UNetPPBackbone(nn.Module):
         c = self._base_channels
         return [c * (2**i) for i in range(self.depth + 1)]
 
-    def _forward_nodes(self, x: torch.Tensor, bottleneck_fn=None) -> dict[str, torch.Tensor]:
-        nodes: dict[str, torch.Tensor] = {}
-        nodes["x00"] = self.x00(x)
-        for i, down in enumerate(self.downs):
-            nodes[f"x{i + 1}0"] = down(nodes[f"x{i}0"])
+    def deep_supervision_keys(self) -> list[str]:
+        """Full-resolution nested nodes used for UNet++ deep supervision."""
+        return [f"x{i}{i}" for i in range(1, self.depth + 1)]
 
-        for i in range(1, self.depth + 1):
-            for j in range(1, i + 1):
-                up = self._upsample(nodes[f"x{i}{j - 1}"], nodes[f"x{i - j}0"])
-                cat = torch.cat([nodes[f"x{i - j}0"], up], dim=1)
-                nodes[f"x{i}{j}"] = self.nested[f"x{i}{j}"](cat)
+    def build_nodes(
+        self,
+        x: torch.Tensor,
+        *,
+        encoder_hooks: list | None = None,
+        bottleneck_fn=None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Run encoder spine + nested decoder.
 
-        key = f"x{self.depth}{self.depth}"
-        if bottleneck_fn is not None:
-            nodes[key] = bottleneck_fn(nodes[key])
-        return nodes
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        nodes = self._forward_nodes(x)
-        return self.outc(nodes[f"x{self.depth}{self.depth}"])
-
-    def forward_with_stem_hook(self, x: torch.Tensor, stem_fn) -> torch.Tensor:
-        h = stem_fn(self.x00(x))
-        nodes: dict[str, torch.Tensor] = {"x00": h}
-        for i, down in enumerate(self.downs):
-            nodes[f"x{i + 1}0"] = down(nodes[f"x{i}0"])
-        for i in range(1, self.depth + 1):
-            for j in range(1, i + 1):
-                up = self._upsample(nodes[f"x{i}{j - 1}"], nodes[f"x{i - j}0"])
-                cat = torch.cat([nodes[f"x{i - j}0"], up], dim=1)
-                nodes[f"x{i}{j}"] = self.nested[f"x{i}{j}"](cat)
-        return self.outc(nodes[f"x{self.depth}{self.depth}"])
-
-    def forward_with_bottleneck_hook(self, x: torch.Tensor, bottleneck_fn) -> torch.Tensor:
-        nodes = self._forward_nodes(x, bottleneck_fn=bottleneck_fn)
-        return self.outc(nodes[f"x{self.depth}{self.depth}"])
-
-    def forward_with_encoder_hooks(self, x: torch.Tensor, encoder_hooks: list) -> torch.Tensor:
-        """Apply FiLM (or other hooks) after each encoder spine block x_i0."""
+        FiLM hooks:
+        - encoder_hooks[i] applied after spine node x_i0
+        - bottleneck_fn applied after deepest spine x_L0 (true bottleneck)
+        """
+        hooks = encoder_hooks or []
         h = self.x00(x)
-        if len(encoder_hooks) > 0 and encoder_hooks[0] is not None:
-            h = encoder_hooks[0](h)
+        if len(hooks) > 0 and hooks[0] is not None:
+            h = hooks[0](h)
         nodes: dict[str, torch.Tensor] = {"x00": h}
+
         for i, down in enumerate(self.downs):
             h = down(nodes[f"x{i}0"])
             hook_idx = i + 1
-            if hook_idx < len(encoder_hooks) and encoder_hooks[hook_idx] is not None:
-                h = encoder_hooks[hook_idx](h)
+            if hook_idx < len(hooks) and hooks[hook_idx] is not None:
+                h = hooks[hook_idx](h)
             nodes[f"x{i + 1}0"] = h
+
+        deep_key = f"x{self.depth}0"
+        if bottleneck_fn is not None:
+            # Avoid double-modulating when encoder hooks already cover x_L0.
+            if not (len(hooks) > self.depth and hooks[self.depth] is not None):
+                nodes[deep_key] = bottleneck_fn(nodes[deep_key])
+
         for i in range(1, self.depth + 1):
             for j in range(1, i + 1):
                 up = self._upsample(nodes[f"x{i}{j - 1}"], nodes[f"x{i - j}0"])
                 cat = torch.cat([nodes[f"x{i - j}0"], up], dim=1)
                 nodes[f"x{i}{j}"] = self.nested[f"x{i}{j}"](cat)
-        return self.outc(nodes[f"x{self.depth}{self.depth}"])
+        return nodes
+
+    def _project(self, nodes: dict[str, torch.Tensor]) -> torch.Tensor:
+        feat = nodes[f"x{self.depth}{self.depth}"]
+        if self.outc is None:
+            return feat
+        return self.outc(feat)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._project(self.build_nodes(x))
+
+    def forward_with_stem_hook(self, x: torch.Tensor, stem_fn) -> torch.Tensor:
+        return self.forward_with_encoder_hooks(x, [stem_fn])
+
+    def forward_with_bottleneck_hook(self, x: torch.Tensor, bottleneck_fn) -> torch.Tensor:
+        return self._project(self.build_nodes(x, bottleneck_fn=bottleneck_fn))
+
+    def forward_with_encoder_hooks(self, x: torch.Tensor, encoder_hooks: list) -> torch.Tensor:
+        """Apply FiLM (or other hooks) after each encoder spine block x_i0."""
+        return self._project(self.build_nodes(x, encoder_hooks=encoder_hooks))
+
+    def forward_nodes(
+        self,
+        x: torch.Tensor,
+        *,
+        encoder_hooks: list | None = None,
+        bottleneck_fn=None,
+    ) -> dict[str, torch.Tensor]:
+        """Return all nested nodes (no output 1×1). Used for deep supervision."""
+        return self.build_nodes(x, encoder_hooks=encoder_hooks, bottleneck_fn=bottleneck_fn)

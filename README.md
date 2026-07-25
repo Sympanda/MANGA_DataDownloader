@@ -110,7 +110,7 @@ The pipeline (`runner.py`) mirrors [Galaxy_ILI](https://github.com/Sympanda/Gala
 - Single **JSONC config** drives everything; snapshot saved per run
 - **CSV splits** for reproducible train/val/test (and ensemble variants)
 - **Composable losses** with per-term weights (0 = off); mask-topology-aware — see [`docs/masked_losses.md`](docs/masked_losses.md)
-- **UNet / UNet++**, optional **coarse/fine head**, **FiLM** spectrum conditioning (`bottleneck` or multi-level `encoder`)
+- **UNet / UNet++**, optional **coarse/fine head**, **FiLM** spectrum conditioning (`bottleneck` or multi-level `encoder`), **UNet++ deep supervision**
 - **Upsample modes:** `bilinear`, `transpose`, `pixel_shuffle`
 - **Spatial pipelines:** symmetric (aligned), `hr_encoder`, `hr_full` — see table above
 - Post-train **eval** on val/test with metrics CSV + prediction plots

@@ -68,7 +68,9 @@ See `manga_models/` and `runner.py` (or `scripts/legacy/train_conditional_unet.p
 v1 conditioning:
 - **SDSS / Legacy**: channel-concat at UNet input (both aligned to Amara grid when `align_imaging_to_amara_grid=True`)
 - **Footprint mask**: optional extra input channel
-- **Spectrum**: 1D CNN → **FiLM at bottleneck only** (simple first pass)
+- **Spectrum**: 1D CNN → **FiLM** (`bottleneck` on deepest encoder, or multi-level `encoder`)
+- **UNet++ deep supervision** (optional): 1×1 heads on nested full-res nodes; aux masked L1 + full loss on deepest
+
 
 ```bash
 python runner.py --config config.jsonc --run-name smoke --epochs 1

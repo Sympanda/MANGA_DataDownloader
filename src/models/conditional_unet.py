@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.config import ModelConfig, effective_detail_scale_multiplier
+from src.models.config import ModelConfig
 from src.models.encoders import CoarseFineHead, FiLM2d, SpectrumEncoder
 from src.models.hr_pipeline import FootprintFusion, GridProjector, HREncoder
 from src.models.unet import UNetBackbone
@@ -27,7 +27,9 @@ def build_backbone(
         norm=config.norm,
     )
     if config.architecture == "unetpp":
-        return UNetPPBackbone(**common, depth=config.n_down)
+        # Deep supervision uses external 1×1 heads on nested nodes; skip backbone outc.
+        with_output_conv = not config.deep_supervision
+        return UNetPPBackbone(**common, depth=config.n_down, with_output_conv=with_output_conv)
     return UNetBackbone(
         **common,
         bottleneck_multiplier=config.bottleneck_multiplier,
@@ -46,7 +48,8 @@ class ConditionalMapModel(nn.Module):
 
         use_coarse_fine = config.output_head == "coarse_fine"
         use_gaussian = config.output_head == "gaussian"
-        if use_coarse_fine:
+        use_ds = config.deep_supervision
+        if use_coarse_fine or use_ds:
             backbone_out = config.base_channels
         elif use_gaussian:
             backbone_out = 2 * config.n_target_maps
@@ -93,6 +96,15 @@ class ConditionalMapModel(nn.Module):
                 config.n_target_maps,
                 coarse_factor=config.coarse_factor,
                 detail_scale_init=config.detail_scale_init,
+            )
+
+        self.ds_heads: nn.ModuleList | None = None
+        if use_ds:
+            self.ds_heads = nn.ModuleList(
+                [
+                    nn.Conv2d(config.base_channels, config.n_target_maps, kernel_size=1)
+                    for _ in range(config.n_down)
+                ]
             )
 
         self.spectrum_encoder: SpectrumEncoder | None = None
@@ -148,25 +160,44 @@ class ConditionalMapModel(nn.Module):
 
         raise ValueError(f"Unknown spatial_pipeline: {cfg.spatial_pipeline!r}")
 
-    def _run_backbone(self, x_spatial: torch.Tensor, cond: torch.Tensor | None) -> torch.Tensor:
+    def _film_hooks(
+        self, cond: torch.Tensor | None
+    ) -> tuple[list | None, object | None]:
+        """Return (encoder_hooks, bottleneck_fn) for the current FiLM mode."""
         if cond is None:
-            return self.backbone(x_spatial)
-
+            return None, None
         if self.encoder_film is not None:
             hooks = [lambda h, film=film, c=cond: film(h, c) for film in self.encoder_film]
-            if hasattr(self.backbone, "forward_with_encoder_hooks"):
-                return self.backbone.forward_with_encoder_hooks(x_spatial, hooks)
-            raise TypeError(f"{type(self.backbone).__name__} lacks forward_with_encoder_hooks")
-
+            return hooks, None
         if self.bottleneck_film is not None:
             film = self.bottleneck_film
 
             def bottleneck_fn(b: torch.Tensor) -> torch.Tensor:
                 return film(b, cond)
 
-            return self.backbone.forward_with_bottleneck_hook(x_spatial, bottleneck_fn)
+            return None, bottleneck_fn
+        return None, None
 
+    def _run_backbone(self, x_spatial: torch.Tensor, cond: torch.Tensor | None) -> torch.Tensor:
+        encoder_hooks, bottleneck_fn = self._film_hooks(cond)
+        if encoder_hooks is not None:
+            if hasattr(self.backbone, "forward_with_encoder_hooks"):
+                return self.backbone.forward_with_encoder_hooks(x_spatial, encoder_hooks)
+            raise TypeError(f"{type(self.backbone).__name__} lacks forward_with_encoder_hooks")
+        if bottleneck_fn is not None:
+            return self.backbone.forward_with_bottleneck_hook(x_spatial, bottleneck_fn)
         return self.backbone(x_spatial)
+
+    def _run_backbone_nodes(
+        self, x_spatial: torch.Tensor, cond: torch.Tensor | None
+    ) -> dict[str, torch.Tensor]:
+        assert isinstance(self.backbone, UNetPPBackbone)
+        encoder_hooks, bottleneck_fn = self._film_hooks(cond)
+        return self.backbone.forward_nodes(
+            x_spatial,
+            encoder_hooks=encoder_hooks,
+            bottleneck_fn=bottleneck_fn,
+        )
 
     def _split_gaussian_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         channels = self.config.n_target_maps
@@ -222,6 +253,37 @@ class ConditionalMapModel(nn.Module):
         }
         return maps, aux
 
+    def _forward_deep_supervision(
+        self,
+        x_backbone: torch.Tensor,
+        cond: torch.Tensor | None,
+        footprint: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        assert self.ds_heads is not None and isinstance(self.backbone, UNetPPBackbone)
+        nodes = self._run_backbone_nodes(x_backbone, cond)
+        keys = self.backbone.deep_supervision_keys()
+        target_size = self._target_size(footprint)
+        deep_maps: list[torch.Tensor] = []
+        for head, key in zip(self.ds_heads, keys):
+            feat = nodes[key]
+            if feat.shape[-2:] != target_size:
+                feat = F.interpolate(feat, size=target_size, mode="bilinear", align_corners=False)
+            if (
+                self.config.spatial_pipeline == "hr_full"
+                and self.footprint_fusion is not None
+                and footprint is not None
+            ):
+                feat = self.footprint_fusion(feat, footprint)
+            deep_maps.append(head(feat))
+
+        maps = deep_maps[-1]
+        aux: dict[str, torch.Tensor] = {
+            "deep_maps": torch.stack(deep_maps, dim=0),  # (L, B, C, H, W)
+        }
+        for i, pred in enumerate(deep_maps):
+            aux[f"ds_{i}"] = pred
+        return maps, aux
+
     def forward(
         self,
         x_imaging: torch.Tensor,
@@ -235,6 +297,10 @@ class ConditionalMapModel(nn.Module):
             cond = self.spectrum_encoder(spectrum_flux)
 
         x_backbone = self._prepare_backbone_input(x_imaging, footprint)
+
+        if self.ds_heads is not None:
+            return self._forward_deep_supervision(x_backbone, cond, footprint)
+
         features = self._run_backbone(x_backbone, cond)
         aux: dict[str, torch.Tensor] = {}
 

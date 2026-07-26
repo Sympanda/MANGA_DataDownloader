@@ -36,9 +36,11 @@ def append_coord_channels(feat: torch.Tensor) -> torch.Tensor:
 
 class CrossAttnHRBlock(nn.Module):
     """
-    Cross-attend UNet features (queries) to HR morphology features (keys/values).
+    Cross-attend UNet features (queries) to HR morphology tokens (keys/values).
 
-    HR stays a spatial token set — never resized onto the UNet grid for concat.
+    HR stays a spatial token set — never resized onto the UNet grid and never
+    concatenated. Positional coords are appended so attention can distinguish
+    centre vs outer-disc morphology.
     """
 
     def __init__(
@@ -53,30 +55,60 @@ class CrossAttnHRBlock(nn.Module):
         super().__init__()
         d = int(attn_dim) if attn_dim is not None else int(unet_channels)
         if d % int(num_heads) != 0:
-            # Round up to a multiple of heads.
             d = int(num_heads) * max(1, d // int(num_heads))
         self.attn_dim = d
-        self.unet_in = nn.Conv2d(unet_channels + 2, d, kernel_size=1, bias=False)
-        self.hr_in = nn.Conv2d(hr_channels + 2, d, kernel_size=1, bias=False)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d,
-            num_heads=int(num_heads),
-            dropout=float(dropout),
-            batch_first=True,
-        )
-        self.out_proj = nn.Conv2d(d, unet_channels, kernel_size=1, bias=False)
+        self.num_heads = int(num_heads)
+        self.head_dim = d // self.num_heads
+        self.scale = self.head_dim**-0.5
+
+        # Explicit W_Q / W_K / W_V (channel-last Linear on tokens with +2 xy coords).
+        self.query_proj = nn.Linear(unet_channels + 2, d, bias=False)
+        self.key_proj = nn.Linear(hr_channels + 2, d, bias=False)
+        self.value_proj = nn.Linear(hr_channels + 2, d, bias=False)
+        self.out_proj = nn.Linear(d, unet_channels, bias=False)
+        self.dropout = nn.Dropout(float(dropout))
         self.norm = nn.GroupNorm(min(8, unet_channels), unet_channels)
 
-    def forward(self, unet_feat: torch.Tensor, hr_feat: torch.Tensor) -> torch.Tensor:
+    def _tokens_with_coords(self, feat: torch.Tensor) -> torch.Tensor:
+        """``(B, C, H, W)`` → ``(B, H*W, C+2)`` with normalised xy."""
+        feat_c = append_coord_channels(feat)
+        return feat_c.flatten(2).transpose(1, 2)
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B, N, D)`` → ``(B, heads, N, head_dim)``."""
+        b, n, _ = x.shape
+        return x.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def forward(
+        self,
+        unet_feat: torch.Tensor,
+        hr_feat: torch.Tensor,
+        *,
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            unet_feat: ``(B, C_u, H, W)`` query grid (any H×W; not required to match HR).
+            hr_feat: ``(B, C_hr, H_hr, W_hr)`` key/value spatial map (any size).
+            return_attn: if True, also return averaged attention ``(B, H*W, N_hr)``.
+        """
         b, _, h, w = unet_feat.shape
-        q = self.unet_in(append_coord_channels(unet_feat))
-        kv = self.hr_in(append_coord_channels(hr_feat))
-        q_tok = q.flatten(2).transpose(1, 2)  # B, Hw, D
-        kv_tok = kv.flatten(2).transpose(1, 2)  # B, Nhr, D
-        ctx, _ = self.attn(q_tok, kv_tok, kv_tok, need_weights=False)
-        ctx = ctx.transpose(1, 2).reshape(b, self.attn_dim, h, w)
-        delta = self.out_proj(ctx)
-        return self.norm(unet_feat + delta)
+        q = self._reshape_heads(self.query_proj(self._tokens_with_coords(unet_feat)))
+        k = self._reshape_heads(self.key_proj(self._tokens_with_coords(hr_feat)))
+        v = self._reshape_heads(self.value_proj(self._tokens_with_coords(hr_feat)))
+
+        # (B, heads, Hw, N_hr)
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        ctx = torch.matmul(attn, v)  # (B, heads, Hw, head_dim)
+        ctx = ctx.transpose(1, 2).contiguous().view(b, h * w, self.attn_dim)
+        delta = self.out_proj(ctx).transpose(1, 2).reshape(b, -1, h, w)
+        out = self.norm(unet_feat + delta)
+        if return_attn:
+            # Mean over heads for diagnostics / spatial tests.
+            return out, attn.mean(dim=1)
+        return out
 
 
 class HREncoder(nn.Module):

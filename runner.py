@@ -48,6 +48,18 @@ def _resolve_run_name(root: Path, run_name: str, autoinc: bool) -> str:
     return candidate
 
 
+def _resolve_use_hr_cross_attn(model_top: dict) -> bool:
+    """Accept both short and long config key names."""
+    if "use_hr_cross_attn" in model_top:
+        return bool(model_top["use_hr_cross_attn"])
+    return bool(model_top.get("use_hr_cross_attention", False))
+
+
+def _resolve_hr_cross_attn_levels(model_top: dict) -> tuple[int, ...]:
+    raw = model_top.get("hr_cross_attn_levels", model_top.get("hr_cross_attention_levels", (0, 1)))
+    return tuple(int(i) for i in raw)
+
+
 def build_data_config(
     data_top: dict,
     *,
@@ -57,7 +69,7 @@ def build_data_config(
     aug = data_top.get("augmentation", {}) or {}
     split = data_top.get("split", {}) or {}
     model_top = model_top or {}
-    use_hr_cross_attn = bool(model_top.get("use_hr_cross_attn", False))
+    use_hr_cross_attn = _resolve_use_hr_cross_attn(model_top)
     resolution = str(data_top.get("imaging_resolution", imaging_resolution))
     if use_hr_cross_attn:
         # UNet++ backbone stays on Amara 76×76; HR is a separate native stream.
@@ -112,9 +124,9 @@ def build_model_config(
     use_legacy = bool(data_top.get("use_legacy", False))
     use_spectrum = bool(data_top.get("use_spectrum", True))
 
-    use_hr_cross_attn = bool(model_top.get("use_hr_cross_attn", False))
+    use_hr_cross_attn = _resolve_use_hr_cross_attn(model_top)
     hr_survey = str(model_top.get("hr_survey", "sdss"))
-    hr_cross_attn_levels = tuple(int(i) for i in model_top.get("hr_cross_attn_levels", (0, 1)))
+    hr_cross_attn_levels = _resolve_hr_cross_attn_levels(model_top)
     if use_hr_cross_attn:
         imaging_resolution = "aligned"
 

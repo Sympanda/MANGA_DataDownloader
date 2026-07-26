@@ -98,10 +98,11 @@
     "hr_project_mode": "bilinear",
 
     // High-res morphology via cross-attention (ablation: set false).
+    // Accepts aliases: use_hr_cross_attention / hr_cross_attention_levels.
     // HR survey: "sdss" (~196 native) or "legacy" (DECaLS/Legacy at native grid).
-    "use_hr_cross_attn": true,
+    "use_hr_cross_attention": true,
     "hr_survey": "sdss",
-    "hr_cross_attn_levels": [0, 1],
+    "hr_cross_attention_levels": [0, 1],
     "hr_encoder_n_down": 3,
     "hr_attn_heads": 4,
     "hr_attn_dropout": 0.0,
@@ -150,7 +151,7 @@
 
     // --- Spatial pipeline notes ---
     // symmetric + aligned  = 76×76 Amara-aligned backbone (Model B/C)
-    // use_hr_cross_attn    = HR morphology as K/V tokens → cross-attn into shallow UNet levels
+    // use_hr_cross_attention = HR morphology as K/V tokens → cross-attn into shallow UNet levels
     //   requires: imaging_resolution "aligned", spatial_pipeline "symmetric"
     //   HR loaded separately (sdss_native or Legacy); not resized onto the UNet grid
     // hr_multiscale+native = legacy concat-fuse path (kept for ablation / old runs)

@@ -179,9 +179,10 @@ class HRCrossAttnTests(unittest.TestCase):
         loss["loss"].backward()
         assert wrap.model.hr_cross_blocks is not None
         for key, block in wrap.model.hr_cross_blocks.items():
-            w = block.out_proj.weight
-            self.assertIsNotNone(w.grad, msg=f"HR cross-attn level {key} has no grad")
-            self.assertGreater(float(w.grad.abs().sum()), 0.0, msg=f"HR cross-attn level {key} dead")
+            for name in ("query_proj", "key_proj", "value_proj", "out_proj"):
+                w = getattr(block, name).weight
+                self.assertIsNotNone(w.grad, msg=f"HR cross-attn level {key} {name} has no grad")
+                self.assertGreater(float(w.grad.abs().sum()), 0.0, msg=f"HR cross-attn level {key} {name} dead")
 
     def test_disabling_hr_cross_attn_changes_output(self) -> None:
         cfg = ModelConfig(

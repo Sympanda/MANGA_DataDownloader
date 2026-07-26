@@ -51,12 +51,12 @@ The model and dataloader support three spatial pipelines. Change only `config.js
 "imaging_resolution": "aligned",
 "spatial_pipeline": "symmetric",
 "footprint_mode": "spatial_channel",
-"use_hr_cross_attn": true,
+"use_hr_cross_attention": true,
 "hr_survey": "sdss",
-"hr_cross_attn_levels": [0, 1]
+"hr_cross_attention_levels": [0, 1]
 
 // Ablation without HR
-"use_hr_cross_attn": false
+"use_hr_cross_attention": false
 
 // Legacy HR multi-scale concat (SDSS-native as backbone)
 "imaging_resolution": "native",

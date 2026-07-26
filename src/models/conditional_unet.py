@@ -65,13 +65,15 @@ class ConditionalMapModel(nn.Module):
         self.hr_encoder: HREncoder | None = None
         self.hr_cross_encoder: HREncoder | None = None
         self.hr_cross_blocks: nn.ModuleDict | None = None
+        self._hr_cross_pyramid_idx: dict[str, int] = {}
         self.grid_projector: GridProjector | None = None
         self.hr_fusions: nn.ModuleList | None = None
         self.footprint_fusion: FootprintFusion | None = None
         self._hr_pyramid: list[torch.Tensor] | None = None
-        self._hr_cross_feat: torch.Tensor | None = None
+        self._hr_cross_pyramid: list[torch.Tensor] | None = None
 
         if config.use_hr_cross_attn:
+            # Side-stream only: never builds GridProjector / HRLevelFusion.
             self.hr_cross_encoder = HREncoder(
                 config.hr_imaging_channels(),
                 base_channels=config.base_channels,
@@ -80,17 +82,31 @@ class ConditionalMapModel(nn.Module):
                 norm=config.norm,
             )
             unet_channels = self._encoder_level_channels_preview(config)
+            levels = tuple(int(i) for i in config.hr_cross_attn_levels)
+            max_level = max(levels)
+            n_hr = len(self.hr_cross_encoder.level_channels)
             blocks: dict[str, CrossAttnHRBlock] = {}
-            for level in config.hr_cross_attn_levels:
-                blocks[str(int(level))] = CrossAttnHRBlock(
+            for level in levels:
+                # Deeper UNet levels attend to deeper (more compressed) HR tokens.
+                hr_idx = n_hr - 1 - (max_level - int(level))
+                hr_idx = max(0, min(hr_idx, n_hr - 1))
+                hr_ch = self.hr_cross_encoder.level_channels[hr_idx]
+                key = str(int(level))
+                blocks[key] = CrossAttnHRBlock(
                     unet_channels[int(level)],
-                    self.hr_cross_encoder.out_channels,
+                    hr_ch,
                     num_heads=config.hr_attn_heads,
                     dropout=config.hr_attn_dropout,
                 )
+                self._hr_cross_pyramid_idx[key] = hr_idx
             self.hr_cross_blocks = nn.ModuleDict(blocks)
 
         if config.spatial_pipeline in ("hr_encoder", "hr_multiscale"):
+            if config.use_hr_cross_attn:
+                raise ValueError(
+                    "use_hr_cross_attn is incompatible with spatial_pipeline "
+                    f"{config.spatial_pipeline!r}; use spatial_pipeline='symmetric'."
+                )
             self.hr_encoder = HREncoder(
                 config.imaging_input_channels(),
                 base_channels=config.base_channels,
@@ -237,12 +253,14 @@ class ConditionalMapModel(nn.Module):
         raise ValueError(f"Unknown spatial_pipeline: {cfg.spatial_pipeline!r}")
 
     def _hr_level_fusions(self) -> list | None:
-        if self.hr_cross_blocks is not None and self._hr_cross_feat is not None:
-            hr = self._hr_cross_feat
+        # Preferred path: cross-attention (no resize / concat).
+        if self.hr_cross_blocks is not None and self._hr_cross_pyramid is not None:
+            pyramid = self._hr_cross_pyramid
             n = self.config.n_down + 1
             fusions: list = [None] * n
             for key, block in self.hr_cross_blocks.items():
                 level = int(key)
+                hr = pyramid[self._hr_cross_pyramid_idx[key]]
 
                 def _fn(unet_h: torch.Tensor, block=block, hr=hr) -> torch.Tensor:
                     return block(unet_h, hr)
@@ -250,6 +268,7 @@ class ConditionalMapModel(nn.Module):
                 fusions[level] = _fn
             return fusions
 
+        # Legacy hr_multiscale resize+concat path only.
         if self.hr_fusions is None or self._hr_pyramid is None:
             return None
         pyramid = self._hr_pyramid
@@ -408,12 +427,19 @@ class ConditionalMapModel(nn.Module):
         if self.spectrum_encoder is not None and spec is not None:
             cond = self.spectrum_encoder(spec)
 
-        self._hr_cross_feat = None
+        self._hr_cross_pyramid = None
         if self.config.use_hr_cross_attn:
             if x_hr is None:
                 raise ValueError("use_hr_cross_attn=true requires x_hr in forward()")
             assert self.hr_cross_encoder is not None
-            self._hr_cross_feat = self.hr_cross_encoder(x_hr)
+            # Keep full spatial pyramid — never globally pool HR before attention.
+            self._hr_cross_pyramid = self.hr_cross_encoder.forward_pyramid(x_hr)
+            # Sanity: cross-attn mode must not use legacy resize/concat modules.
+            if self.hr_fusions is not None or self.grid_projector is not None:
+                raise RuntimeError(
+                    "Internal error: HR cross-attention mode must not use "
+                    "GridProjector / HRLevelFusion"
+                )
 
         x_backbone = self._prepare_backbone_input(x_imaging, footprint)
 

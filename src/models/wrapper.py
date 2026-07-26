@@ -58,10 +58,41 @@ def prepare_spatial_input(batch: dict[str, object], config: ModelConfig) -> torc
 
 
 def prepare_spectrum_input(batch: dict[str, object], config: ModelConfig) -> torch.Tensor | None:
+    """
+    Build spectrum tensor for SpectrumEncoder.
+
+    Returns ``(B, C, n_wave)`` with channels: flux [, λ_norm] [, log1p(ivar)].
+    """
     if not config.use_spectrum:
         return None
     inputs = batch.get("inputs", {})
-    return _nan_to_num(inputs["spectrum"]["flux"].float())  # type: ignore[index]
+    spec = inputs["spectrum"]  # type: ignore[index]
+    flux = _nan_to_num(spec["flux"].float())  # type: ignore[index]
+    channels: list[torch.Tensor] = [flux]
+
+    if config.spectrum_use_wavelength:
+        wave = spec.get("wave")  # type: ignore[union-attr]
+        if wave is None:
+            b, n = flux.shape
+            t = torch.linspace(0.0, 1.0, n, device=flux.device, dtype=flux.dtype)
+            wave_norm = (2.0 * t - 1.0).unsqueeze(0).expand(b, -1)
+        else:
+            wave_t = _nan_to_num(wave.float())
+            lo = float(config.spectrum_wave_min)
+            hi = float(config.spectrum_wave_max)
+            wave_norm = 2.0 * (wave_t - lo) / max(hi - lo, 1e-6) - 1.0
+            wave_norm = wave_norm.clamp(-1.0, 1.0)
+        channels.append(wave_norm)
+
+    if config.spectrum_use_ivar:
+        ivar = spec.get("ivar")  # type: ignore[union-attr]
+        if ivar is None:
+            ivar_t = torch.ones_like(flux)
+        else:
+            ivar_t = _nan_to_num(ivar.float()).clamp_min(0.0)
+        channels.append(torch.log1p(ivar_t))
+
+    return torch.stack(channels, dim=1)
 
 
 def prepare_targets_and_masks(
@@ -136,7 +167,7 @@ class MapGenerator(nn.Module):
         detail_mult = effective_detail_scale_multiplier(self.config, epoch)
         pred_maps, aux = self.model(
             x,
-            spectrum_flux=spec,
+            spectrum=spec,
             footprint=footprint,
             detail_scale_multiplier=detail_mult,
         )

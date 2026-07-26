@@ -10,9 +10,10 @@ OutputHeadType = Literal["single", "coarse_fine", "gaussian"]
 FilmInjection = Literal["none", "bottleneck", "encoder"]
 UpsampleMode = Literal["bilinear", "transpose", "pixel_shuffle"]
 ImagingResolution = Literal["aligned", "native"]
-SpatialPipeline = Literal["symmetric", "hr_encoder", "hr_full"]
+SpatialPipeline = Literal["symmetric", "hr_encoder", "hr_full", "hr_multiscale"]
 FootprintMode = Literal["spatial_channel", "fusion_concat", "loss_only"]
 HRProjectMode = Literal["bilinear", "learned"]
+SpectrumPooling = Literal["avg", "attention"]
 
 
 @dataclass
@@ -51,14 +52,21 @@ class ModelConfig:
     cond_dim: int = 384
     spectrum_n_wave: int = 4563
     film_injection: FilmInjection = "bottleneck"
+    # Spectrum encoder (Task 3): pooling + optional λ / ivar channels.
+    spectrum_pooling: SpectrumPooling = "attention"
+    spectrum_use_wavelength: bool = True
+    spectrum_use_ivar: bool = True
+    # Fixed wavelength range for λ_norm (matches manga_prep default grid).
+    spectrum_wave_min: float = 3622.0
+    spectrum_wave_max: float = 10354.0
 
     # UNet++ deep supervision (Zhou et al.): 1×1 heads on full-res nested nodes.
     # Preferred over coarse_fine for multi-scale fidelity on this architecture.
     deep_supervision: bool = False
-    # Per-level weights for auxiliary heads x11…x{L-1}{L-1} (deepest uses full loss).
+    # Per-level weights for auxiliary heads (deepest uses full loss).
     # None → linear ramp (1/L … (L-1)/L). Length must be n_down - 1 when set.
     deep_supervision_weights: list[float] | None = None
-    # Aux-head loss (full loss stack stays on deepest). Prefer "grad" for sharpness.
+    # Aux-head loss (full loss stack stays on deepest).
     deep_supervision_loss: Literal["l1", "mse", "charbonnier", "grad", "laplacian"] = "l1"
 
     coarse_factor: int = 2
@@ -70,6 +78,14 @@ class ModelConfig:
     )
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.1, 0.05])
     loss_params: dict[str, dict] = field(default_factory=lambda: {"charbonnier": {"eps": 1e-3}})
+
+    def spectrum_input_channels(self) -> int:
+        channels = 1  # flux
+        if self.spectrum_use_wavelength:
+            channels += 1
+        if self.spectrum_use_ivar:
+            channels += 1
+        return channels
 
     def imaging_input_channels(self) -> int:
         channels = 0
@@ -90,7 +106,7 @@ class ModelConfig:
             if self.footprint_mode == "spatial_channel" and self.uses_footprint_in_model():
                 channels += 1
             return channels
-        if self.spatial_pipeline == "hr_encoder":
+        if self.spatial_pipeline in ("hr_encoder", "hr_multiscale"):
             return self.base_channels
         if self.spatial_pipeline == "hr_full":
             return self.imaging_input_channels()
@@ -109,7 +125,12 @@ class ModelConfig:
         if self.spatial_pipeline == "symmetric" and self.imaging_resolution == "native":
             raise ValueError(
                 "spatial_pipeline='symmetric' requires imaging_resolution='aligned'. "
-                "Use spatial_pipeline='hr_encoder' or 'hr_full' with native SDSS."
+                "Use spatial_pipeline='hr_encoder', 'hr_multiscale', or 'hr_full' with native SDSS."
+            )
+        if self.spatial_pipeline == "hr_multiscale" and self.imaging_resolution != "native":
+            raise ValueError(
+                "spatial_pipeline='hr_multiscale' requires imaging_resolution='native' "
+                "so SDSS is encoded before the 76×76 target grid."
             )
         if self.footprint_mode == "spatial_channel" and self.spatial_pipeline != "symmetric":
             raise ValueError(

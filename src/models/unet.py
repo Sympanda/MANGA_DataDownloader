@@ -47,9 +47,9 @@ class SpatialUpsample2x(nn.Module):
 
 
 def nested_upsample_channel_counts(base_channels: int, depth: int) -> set[int]:
-    """Channel widths of UNet++ nodes x{i}{j-1} that get upsampled before concatenation."""
+    """Channel widths of UNet++ nodes X^{i+1,*} that get upsampled into level i."""
     c = base_channels
-    return {c * (2 ** (i - j + 1)) for i in range(1, depth + 1) for j in range(1, i + 1)}
+    return {c * (2 ** (i + 1)) for i in range(depth)}
 
 
 class ConvBlock(nn.Module):
@@ -65,7 +65,7 @@ class ConvBlock(nn.Module):
         residual: bool = False,
     ) -> None:
         super().__init__()
-        self.residual = residual and in_ch == out_ch
+        self.residual = residual
         Norm: type[nn.Module]
         if norm == "gn":
             Norm = lambda c: nn.GroupNorm(min(8, c), c)  # noqa: E731
@@ -83,13 +83,17 @@ class ConvBlock(nn.Module):
         if dropout > 0:
             layers.append(nn.Dropout2d(p=dropout))
         self.net = nn.Sequential(*layers)
-        self.proj = nn.Conv2d(in_ch, out_ch, 1, bias=False) if residual and in_ch != out_ch else None
+        if residual:
+            self.proj: nn.Module = (
+                nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+            )
+        else:
+            self.proj = None  # type: ignore[assignment]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.net(x)
         if self.residual:
-            skip = x if self.proj is None else self.proj(x)
-            y = y + skip
+            y = y + self.proj(x)
         return y
 
 
@@ -219,17 +223,24 @@ class UNetBackbone(nn.Module):
         x: torch.Tensor,
         encoder_hooks: list,
         bottleneck_fn=None,
+        *,
+        level_fusions: list | None = None,
     ) -> torch.Tensor:
-        """Apply hook after each encoder block (stem + downs); optional extra bottleneck hook."""
+        """Apply hook after each encoder block (stem + downs); optional HR fusions."""
+        fusions = level_fusions or []
         h = self.inc(x)
         if len(encoder_hooks) > 0 and encoder_hooks[0] is not None:
             h = encoder_hooks[0](h)
+        if len(fusions) > 0 and fusions[0] is not None:
+            h = fusions[0](h)
         skips = [h]
         for i, down in enumerate(self.downs):
             h = down(h)
             hook_idx = i + 1
             if hook_idx < len(encoder_hooks) and encoder_hooks[hook_idx] is not None:
                 h = encoder_hooks[hook_idx](h)
+            if hook_idx < len(fusions) and fusions[hook_idx] is not None:
+                h = fusions[hook_idx](h)
             skips.append(h)
         bottleneck = skips.pop()
         if bottleneck_fn is not None:

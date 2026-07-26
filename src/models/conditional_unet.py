@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from src.models.config import ModelConfig
 from src.models.encoders import CoarseFineHead, FiLM2d, SpectrumEncoder
-from src.models.hr_pipeline import FootprintFusion, GridProjector, HREncoder
+from src.models.hr_pipeline import FootprintFusion, GridProjector, HREncoder, HRLevelFusion
 from src.models.unet import UNetBackbone
 from src.models.unetpp import UNetPPBackbone
 
@@ -58,9 +58,11 @@ class ConditionalMapModel(nn.Module):
 
         self.hr_encoder: HREncoder | None = None
         self.grid_projector: GridProjector | None = None
+        self.hr_fusions: nn.ModuleList | None = None
         self.footprint_fusion: FootprintFusion | None = None
+        self._hr_pyramid: list[torch.Tensor] | None = None
 
-        if config.spatial_pipeline == "hr_encoder":
+        if config.spatial_pipeline in ("hr_encoder", "hr_multiscale"):
             self.hr_encoder = HREncoder(
                 config.imaging_input_channels(),
                 base_channels=config.base_channels,
@@ -69,12 +71,27 @@ class ConditionalMapModel(nn.Module):
                 norm=config.norm,
             )
             self.grid_projector = GridProjector(
-                self.hr_encoder.out_channels,
+                self.hr_encoder.level_channels[0]
+                if config.spatial_pipeline == "hr_multiscale"
+                else self.hr_encoder.out_channels,
                 config.base_channels,
                 mode=config.hr_project_mode,
                 dropout=config.dropout,
                 norm=config.norm,
             )
+            if config.spatial_pipeline == "hr_multiscale":
+                unet_channels = self._encoder_level_channels_preview(config)
+                self.hr_fusions = nn.ModuleList(
+                    [
+                        HRLevelFusion(
+                            hr_ch,
+                            unet_ch,
+                            dropout=config.dropout,
+                            norm=config.norm,
+                        )
+                        for hr_ch, unet_ch in zip(self.hr_encoder.level_channels, unet_channels)
+                    ]
+                )
             if config.footprint_mode == "fusion_concat":
                 self.footprint_fusion = FootprintFusion(
                     config.base_channels,
@@ -115,6 +132,8 @@ class ConditionalMapModel(nn.Module):
             self.spectrum_encoder = SpectrumEncoder(
                 n_wave=config.spectrum_n_wave,
                 out_dim=config.cond_dim,
+                in_channels=config.spectrum_input_channels(),
+                pooling=config.spectrum_pooling,
             )
             if config.film_injection == "bottleneck":
                 self.bottleneck_film = FiLM2d(
@@ -126,6 +145,18 @@ class ConditionalMapModel(nn.Module):
                 self.encoder_film = nn.ModuleList(
                     FiLM2d(config.cond_dim, ch) for ch in level_channels
                 )
+
+    @staticmethod
+    def _encoder_level_channels_preview(config: ModelConfig) -> list[int]:
+        """Channel widths of backbone encoder spine (matches UNet / UNet++)."""
+        c = config.base_channels
+        if config.architecture == "unetpp":
+            return [c * (2**i) for i in range(config.n_down + 1)]
+        m = config.bottleneck_multiplier
+        levels = [c]
+        for i in range(config.n_down):
+            levels.append(min(c * (2 ** (i + 1)), c * m))
+        return levels
 
     def _target_size(self, footprint: torch.Tensor | None) -> tuple[int, int]:
         if footprint is not None:
@@ -139,6 +170,8 @@ class ConditionalMapModel(nn.Module):
         footprint: torch.Tensor | None,
     ) -> torch.Tensor:
         cfg = self.config
+        self._hr_pyramid = None
+
         if cfg.spatial_pipeline == "symmetric":
             if cfg.footprint_mode == "spatial_channel" and footprint is not None:
                 if footprint.ndim == x_imaging.ndim - 1:
@@ -155,10 +188,38 @@ class ConditionalMapModel(nn.Module):
                 features = self.footprint_fusion(features, footprint)
             return features
 
+        if cfg.spatial_pipeline == "hr_multiscale":
+            assert (
+                self.hr_encoder is not None
+                and self.grid_projector is not None
+                and self.hr_fusions is not None
+            )
+            target_size = self._target_size(footprint)
+            pyramid = self.hr_encoder.forward_pyramid(x_imaging)
+            self._hr_pyramid = pyramid
+            # Stem HR features → target-grid UNet++ input (detail still encoded above).
+            features = self.grid_projector(pyramid[0], target_size)
+            if self.footprint_fusion is not None and footprint is not None:
+                features = self.footprint_fusion(features, footprint)
+            return features
+
         if cfg.spatial_pipeline == "hr_full":
             return x_imaging
 
         raise ValueError(f"Unknown spatial_pipeline: {cfg.spatial_pipeline!r}")
+
+    def _hr_level_fusions(self) -> list | None:
+        if self.hr_fusions is None or self._hr_pyramid is None:
+            return None
+        pyramid = self._hr_pyramid
+
+        def _make(fuse: HRLevelFusion, hr: torch.Tensor):
+            def _fn(unet_h: torch.Tensor, fuse=fuse, hr=hr) -> torch.Tensor:
+                return fuse(unet_h, hr)
+
+            return _fn
+
+        return [_make(fuse, hr) for fuse, hr in zip(self.hr_fusions, pyramid)]
 
     def _film_hooks(
         self, cond: torch.Tensor | None
@@ -180,9 +241,16 @@ class ConditionalMapModel(nn.Module):
 
     def _run_backbone(self, x_spatial: torch.Tensor, cond: torch.Tensor | None) -> torch.Tensor:
         encoder_hooks, bottleneck_fn = self._film_hooks(cond)
-        if encoder_hooks is not None:
+        level_fusions = self._hr_level_fusions()
+        if encoder_hooks is not None or level_fusions is not None:
+            hooks = encoder_hooks or [None] * (self.config.n_down + 1)
             if hasattr(self.backbone, "forward_with_encoder_hooks"):
-                return self.backbone.forward_with_encoder_hooks(x_spatial, encoder_hooks)
+                return self.backbone.forward_with_encoder_hooks(
+                    x_spatial,
+                    hooks,
+                    bottleneck_fn=bottleneck_fn,
+                    level_fusions=level_fusions,
+                )
             raise TypeError(f"{type(self.backbone).__name__} lacks forward_with_encoder_hooks")
         if bottleneck_fn is not None:
             return self.backbone.forward_with_bottleneck_hook(x_spatial, bottleneck_fn)
@@ -197,6 +265,7 @@ class ConditionalMapModel(nn.Module):
             x_spatial,
             encoder_hooks=encoder_hooks,
             bottleneck_fn=bottleneck_fn,
+            level_fusions=self._hr_level_fusions(),
         )
 
     def _split_gaussian_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -242,7 +311,6 @@ class ConditionalMapModel(nn.Module):
         maps = self._resize_to_target(mu, footprint)
         if log_var.shape[-2:] != target_size:
             log_var = F.interpolate(log_var, size=target_size, mode="bilinear", align_corners=False)
-        # NLL loss treats log_var as log(σ²); σ = exp(½ log_var).
         log_var_clamped = log_var.clamp(
             min=self.config.loss_params.get("gaussian_nll", {}).get("min_log_var", -6.0),
             max=self.config.loss_params.get("gaussian_nll", {}).get("max_log_var", 6.0),
@@ -278,7 +346,7 @@ class ConditionalMapModel(nn.Module):
 
         maps = deep_maps[-1]
         aux: dict[str, torch.Tensor] = {
-            "deep_maps": torch.stack(deep_maps, dim=0),  # (L, B, C, H, W)
+            "deep_maps": torch.stack(deep_maps, dim=0),
         }
         for i, pred in enumerate(deep_maps):
             aux[f"ds_{i}"] = pred
@@ -288,13 +356,15 @@ class ConditionalMapModel(nn.Module):
         self,
         x_imaging: torch.Tensor,
         *,
+        spectrum: torch.Tensor | None = None,
         spectrum_flux: torch.Tensor | None = None,
         footprint: torch.Tensor | None = None,
         detail_scale_multiplier: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        spec = spectrum if spectrum is not None else spectrum_flux
         cond = None
-        if self.spectrum_encoder is not None and spectrum_flux is not None:
-            cond = self.spectrum_encoder(spectrum_flux)
+        if self.spectrum_encoder is not None and spec is not None:
+            cond = self.spectrum_encoder(spec)
 
         x_backbone = self._prepare_backbone_input(x_imaging, footprint)
 

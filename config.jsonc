@@ -54,7 +54,7 @@
     "use_footprint_mask": true,
 
     // v10 baseline: aligned 76×76 (same as v8). Native HR deferred until cutouts are cleaned.
-    "imaging_resolution": "aligned",
+    "imaging_resolution": "native",
 
     "spectrum_mode": "fake",
     "spectrum_fallback": true,
@@ -82,9 +82,9 @@
     "output_head": "single",
 
     // --- Spatial pipeline (v8 symmetric baseline) ---
-    "imaging_resolution": "aligned",
-    "spatial_pipeline": "symmetric",
-    "footprint_mode": "spatial_channel",
+    "imaging_resolution": "native",
+    "spatial_pipeline": "hr_multiscale",
+    "footprint_mode": "fusion_concat",
     "target_spatial_size": 76,
     "hr_project_mode": "bilinear",
 
@@ -102,12 +102,26 @@
     "cond_dim": 64,
     "film_injection": "encoder",
 
+    // --- Spectrum encoder (Task 3) ---
+    // pooling: "attention" (keep wavelength structure) | "avg" (legacy global pool)
+    "spectrum_pooling": "attention",
+    "spectrum_use_wavelength": true,
+    "spectrum_use_ivar": true,
+    "spectrum_wave_min": 3622.0,
+    "spectrum_wave_max": 10354.0,
+
     // UNet++ deep supervision (Zhou et al.) — preferred over coarse_fine for fidelity.
-    // Aux heads on nested full-res nodes x11…x{L-1}{L-1}; deepest uses the full loss stack.
+    // Aux heads on nested full-res nodes X^{0,1}…X^{0,L-1}; deepest uses the full loss stack.
     "deep_supervision": true,
-    // Milder than 1/L…(L-1)/L so aux structure terms don't swamp the deepest head.
-    "deep_supervision_weights": [0.2, 0.4, 0.6],
-    "deep_supervision_loss": "grad",
+    // null → linear ramp (1/L … (L-1)/L) for the L-1 auxiliary heads
+    "deep_supervision_weights": null,
+    "deep_supervision_loss": "l1",
+
+    // --- Spatial pipeline notes (Task 4) ---
+    // symmetric + aligned  = encode already-resampled 76×76 imaging (Model B/C)
+    // hr_multiscale+native = multi-scale HR SDSS pyramid fused into UNet++ (Model D/E)
+    //   requires: imaging_resolution "native", footprint_mode "fusion_concat" or "loss_only"
+    // hr_encoder / hr_full = legacy single-bottleneck / full-res paths
 
     // --- Coarse/fine head (disabled when deep_supervision=true; use output_head="single") ---
     "coarse_factor": 2,
@@ -123,9 +137,8 @@
     //   tv_pred               — weak TV on prediction across valid neighbours
     //   residual_amp          — L1 on coarse/fine residual branch (coarse_fine head only)
     //   residual_tv           — pairwise TV on residual branch (coarse_fine head only)
-    // Deep supervision (UNet++): aux loss via deep_supervision_* (grad preferred for sharpness).
-    // v11 sharpness: stronger grad/laplacian; DS aux uses grad not L1.
-    // Prefer deep_supervision over coarse_fine when architecture=unetpp.
+    // Pixel/grad/laplacian reductions are per-(galaxy, map), then mean over active maps.
+    // Model B baseline: fixed UNet++ + balanced losses (revert sharp v11 weights).
     "losses": [
       "charbonnier",
       "l1",
@@ -141,8 +154,8 @@
       0.0,   // charbonnier
       1.0,   // l1
       0.0,   // mse
-      1.0,   // grad   (was 0.4)
-      0.4,   // laplacian (was 0.18)
+      0.4,   // grad
+      0.18,  // laplacian
       0.0,   // integration
       0.0,   // tv_pred
       0.0,   // residual_amp

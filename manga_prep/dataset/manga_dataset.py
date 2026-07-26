@@ -465,6 +465,13 @@ def collate_manga_batch(batch: list[dict[str, object]]) -> dict[str, object]:
                 )
                 inputs[f"{key}_bands"] = first_inputs[key]["bands"]
         if "spectrum" in first_inputs:
+            ivars = []
+            for item in batch:
+                iv = item["inputs"]["spectrum"].get("ivar")
+                flux = item["inputs"]["spectrum"]["flux"]
+                if iv is None:
+                    iv = np.ones_like(flux, dtype=np.float32)
+                ivars.append(np.asarray(iv, dtype=np.float32))
             inputs["spectrum"] = {
                 "wave": torch.from_numpy(
                     np.stack([item["inputs"]["spectrum"]["wave"] for item in batch], axis=0)
@@ -472,9 +479,7 @@ def collate_manga_batch(batch: list[dict[str, object]]) -> dict[str, object]:
                 "flux": torch.from_numpy(
                     np.stack([item["inputs"]["spectrum"]["flux"] for item in batch], axis=0)
                 ),
-                "ivar": torch.from_numpy(
-                    np.stack([item["inputs"]["spectrum"]["ivar"] for item in batch], axis=0)
-                ),
+                "ivar": torch.from_numpy(np.stack(ivars, axis=0)),
                 "is_real_sdss_fiber": torch.tensor(
                     [item["inputs"]["spectrum"]["is_real_sdss_fiber"] for item in batch],
                     dtype=torch.bool,

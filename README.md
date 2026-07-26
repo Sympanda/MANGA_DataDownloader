@@ -124,6 +124,7 @@ Pre-v2 training scripts live in `scripts/legacy/` if you still need them.
 - **Map target scaling:** [`manga_prep/targets/README.md`](manga_prep/targets/README.md)
 - **Config reference:** [`config.jsonc`](config.jsonc)
 - **Mask-safe losses:** [`docs/masked_losses.md`](docs/masked_losses.md)
+- **Ablations / config toggles (B–E):** [`docs/model_ablations.md`](docs/model_ablations.md)
 
 ## Tests
 

@@ -110,6 +110,11 @@ def build_model_config(
         residual_blocks=bool(model_top.get("residual_blocks", True)),
         cond_dim=int(model_top.get("cond_dim", 384)),
         film_injection=model_top.get("film_injection", "bottleneck"),
+        spectrum_pooling=model_top.get("spectrum_pooling", "attention"),
+        spectrum_use_wavelength=bool(model_top.get("spectrum_use_wavelength", True)),
+        spectrum_use_ivar=bool(model_top.get("spectrum_use_ivar", True)),
+        spectrum_wave_min=float(model_top.get("spectrum_wave_min", 3622.0)),
+        spectrum_wave_max=float(model_top.get("spectrum_wave_max", 10354.0)),
         deep_supervision=bool(model_top.get("deep_supervision", False)),
         deep_supervision_weights=(
             [float(w) for w in model_top["deep_supervision_weights"]]

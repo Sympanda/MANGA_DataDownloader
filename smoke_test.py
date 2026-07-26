@@ -32,6 +32,7 @@ def main() -> int:
         dict(spatial_pipeline="hr_encoder", imaging_resolution="native", footprint_mode="fusion_concat"),
         dict(spatial_pipeline="hr_full", imaging_resolution="native", footprint_mode="fusion_concat"),
         dict(spatial_pipeline="hr_encoder", imaging_resolution="native", footprint_mode="loss_only"),
+        dict(spatial_pipeline="hr_multiscale", imaging_resolution="native", footprint_mode="fusion_concat"),
     ]
     for arch in ("unet", "unetpp"):
         for head in ("single", "coarse_fine"):

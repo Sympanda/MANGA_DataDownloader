@@ -16,10 +16,12 @@ Each output channel `C` can have a **different** valid mask (sparse/low-SNR maps
 
 ### Pixel losses (`charbonnier`, `l1`, `mse`)
 
-Computed only where `loss_mask > 0`, normalised by the count of valid pixels:
+Computed only where `loss_mask > 0`. Reduction is **per (galaxy, map)** then
+averaged over active maps (equal weight regardless of valid-pixel count):
 
-```python
-loss = (raw * mask).sum() / (mask.sum() + eps)
+```text
+L_bc = sum_{xy} M_bcxy * ℓ_bcxy / sum_{xy} M_bcxy
+L    = mean({ L_bc | sum_{xy} M_bcxy > 0 })
 ```
 
 No target values are invented outside the mask.

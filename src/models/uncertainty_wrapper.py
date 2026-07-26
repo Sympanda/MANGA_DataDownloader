@@ -40,7 +40,7 @@ class UncertaintyMapGenerator(nn.Module):
         detail_mult = effective_detail_scale_multiplier(self.config, epoch)
         pred_maps, aux = self.model(
             x,
-            spectrum_flux=spec,
+            spectrum=spec,
             footprint=footprint,
             detail_scale_multiplier=detail_mult,
         )

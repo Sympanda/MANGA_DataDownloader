@@ -24,9 +24,33 @@ def _ensure_bchw(mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
-    """Mean over elements where mask > 0. mask and x must match shape."""
+    """
+    Per-(batch, channel) masked spatial mean, then mean over active maps.
+
+    Each galaxy×physical-map with ≥1 valid pixel contributes equally; empty
+    (B, C) pairs are excluded entirely (not counted as zero loss).
+    """
     m = (mask > 0).to(dtype=x.dtype)
-    return (x * m).sum() / m.sum().clamp_min(eps)
+    pixel_sum = (x * m).sum(dim=(-2, -1))
+    valid_count = m.sum(dim=(-2, -1))
+    per_map = pixel_sum / valid_count.clamp_min(eps)
+    active = valid_count > 0
+    if not bool(active.any()):
+        return x.new_tensor(0.0)
+    return per_map[active].mean()
+
+
+def _per_map_masked_mean(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (per_map_mean[B,C], active[B,C] bool)."""
+    m = (mask > 0).to(dtype=x.dtype)
+    valid_count = m.sum(dim=(-2, -1))
+    per_map = (x * m).sum(dim=(-2, -1)) / valid_count.clamp_min(eps)
+    return per_map, valid_count > 0
 
 
 def pairwise_valid_masks(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,7 +115,9 @@ def masked_pairwise_grad_loss(
     """
     Supervised gradient loss on valid horizontal/vertical neighbours only.
 
-    Does not compare across invalid mask boundaries (avoids artificial edges).
+    X- and Y-pair counts are independent. Each (galaxy, map) gets
+    mean(|Δx|) + mean(|Δy|) over its valid pairs, then those map losses
+    are averaged equally.
     """
     mask = _ensure_bchw(loss_mask, pred)
     tgt = _safe_target(target, mask)
@@ -102,9 +128,15 @@ def masked_pairwise_grad_loss(
     dy_pred = pred[:, :, 1:, :] - pred[:, :, :-1, :]
     dy_true = tgt[:, :, 1:, :] - tgt[:, :, :-1, :]
 
-    loss_dx = _masked_mean((dx_pred - dx_true).abs(), valid_x)
-    loss_dy = _masked_mean((dy_pred - dy_true).abs(), valid_y)
-    return loss_dx + loss_dy
+    loss_dx, active_x = _per_map_masked_mean((dx_pred - dx_true).abs(), valid_x)
+    loss_dy, active_y = _per_map_masked_mean((dy_pred - dy_true).abs(), valid_y)
+    combined = pred.new_zeros(loss_dx.shape)
+    combined = torch.where(active_x, combined + loss_dx, combined)
+    combined = torch.where(active_y, combined + loss_dy, combined)
+    active = active_x | active_y
+    if not bool(active.any()):
+        return pred.new_tensor(0.0)
+    return combined[active].mean()
 
 
 def _per_channel_conv2d(x: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
@@ -141,13 +173,21 @@ def prediction_tv_loss(pred: torch.Tensor, loss_mask: torch.Tensor) -> torch.Ten
     """
     Weak total-variation regulariser on the prediction (unsupervised).
 
-    Penalises |Δpred| only across valid neighbour pairs.
+    Penalises |Δpred| only across valid neighbour pairs, balanced per (B, C).
     """
     mask = _ensure_bchw(loss_mask, pred)
     valid_x, valid_y = pairwise_valid_masks(mask)
     tv_x = (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs()
     tv_y = (pred[:, :, 1:, :] - pred[:, :, :-1, :]).abs()
-    return _masked_mean(tv_x, valid_x) + _masked_mean(tv_y, valid_y)
+    loss_x, active_x = _per_map_masked_mean(tv_x, valid_x)
+    loss_y, active_y = _per_map_masked_mean(tv_y, valid_y)
+    combined = pred.new_zeros(loss_x.shape)
+    combined = torch.where(active_x, combined + loss_x, combined)
+    combined = torch.where(active_y, combined + loss_y, combined)
+    active = active_x | active_y
+    if not bool(active.any()):
+        return pred.new_tensor(0.0)
+    return combined[active].mean()
 
 
 def residual_amplitude_loss(residual: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:

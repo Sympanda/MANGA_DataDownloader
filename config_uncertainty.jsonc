@@ -96,6 +96,10 @@
     "cond_dim": 64,
     "film_injection": "encoder",
 
+    "spectrum_pooling": "attention",
+    "spectrum_use_wavelength": true,
+    "spectrum_use_ivar": true,
+
     "losses": [
       "gaussian_nll",
       "charbonnier",

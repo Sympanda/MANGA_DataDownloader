@@ -1,17 +1,37 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SpectrumEncoder(nn.Module):
-    """1D CNN over resampled flux -> conditioning vector."""
+SpectrumPooling = Literal["avg", "attention"]
 
-    def __init__(self, n_wave: int = 4563, out_dim: int = 384) -> None:
+
+class SpectrumEncoder(nn.Module):
+    """
+    1D CNN over spectrum channels → conditioning vector for FiLM.
+
+    Input ``spectrum`` is ``(B, n_wave)`` (flux only) or ``(B, C, n_wave)`` with
+    channels ordered as: flux [, wavelength] [, ivar].
+    """
+
+    def __init__(
+        self,
+        n_wave: int = 4563,
+        out_dim: int = 384,
+        *,
+        in_channels: int = 1,
+        pooling: SpectrumPooling = "attention",
+    ) -> None:
         super().__init__()
+        self.n_wave = n_wave
+        self.pooling = pooling
+        self.in_channels = in_channels
         self.net = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=7, stride=2, padding=3),
+            nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3),
             nn.ReLU(inplace=True),
             nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
             nn.ReLU(inplace=True),
@@ -19,17 +39,38 @@ class SpectrumEncoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool1d(1),
         )
+        self.attn: nn.Module | None
+        if pooling == "attention":
+            self.attn = nn.Sequential(
+                nn.Linear(256, 128),
+                nn.Tanh(),
+                nn.Linear(128, 1),
+            )
+        else:
+            self.attn = None
         self.proj = nn.Sequential(
             nn.Linear(256, out_dim),
             nn.ReLU(inplace=True),
             nn.Linear(out_dim, out_dim),
         )
 
-    def forward(self, flux: torch.Tensor) -> torch.Tensor:
-        x = self.net(flux.unsqueeze(1)).flatten(1)
-        return self.proj(x)
+    def forward(self, spectrum: torch.Tensor) -> torch.Tensor:
+        if spectrum.ndim == 2:
+            spectrum = spectrum.unsqueeze(1)
+        if spectrum.shape[1] != self.in_channels:
+            raise ValueError(
+                f"SpectrumEncoder expected {self.in_channels} channels, got {spectrum.shape[1]}"
+            )
+        feats = self.net(spectrum)  # (B, 256, L')
+        if self.pooling == "avg" or self.attn is None:
+            pooled = F.adaptive_avg_pool1d(feats, 1).flatten(1)
+        else:
+            tokens = feats.transpose(1, 2)  # (B, L', 256)
+            scores = self.attn(tokens)  # (B, L', 1)
+            weights = torch.softmax(scores, dim=1)
+            pooled = (tokens * weights).sum(dim=1)
+        return self.proj(pooled)
 
 
 class FiLM2d(nn.Module):

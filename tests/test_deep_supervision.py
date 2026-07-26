@@ -36,6 +36,9 @@ class FilmAndDeepSupervisionTests(unittest.TestCase):
             base_channels=16,
             n_down=3,
             deep_supervision=False,
+            spectrum_use_wavelength=False,
+            spectrum_use_ivar=False,
+            spectrum_pooling="avg",
         )
         model = ConditionalMapModel(cfg)
         seen: dict[str, tuple[int, ...]] = {}

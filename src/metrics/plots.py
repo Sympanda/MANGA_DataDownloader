@@ -218,6 +218,7 @@ def evaluate_map_predictions(
 ) -> list[dict[str, float | str]]:
     from src.models.wrapper import (
         prepare_footprint_input,
+        prepare_hr_imaging_input,
         prepare_imaging_input,
         prepare_spectrum_input,
         prepare_targets_and_masks,
@@ -230,6 +231,9 @@ def evaluate_map_predictions(
     for batch in dataloader:
         plateifus = batch["plateifu"]
         x = prepare_imaging_input(batch, model.config).to(device)
+        x_hr = prepare_hr_imaging_input(batch, model.config)
+        if x_hr is not None:
+            x_hr = x_hr.to(device)
         footprint = prepare_footprint_input(batch, model.config)
         if footprint is not None:
             footprint = footprint.to(device)
@@ -240,7 +244,7 @@ def evaluate_map_predictions(
         targets = targets.to(device)
         masks = masks.to(device)
 
-        pred, _aux = model.model(x, spectrum_flux=spec, footprint=footprint)
+        pred, _aux = model.model(x, spectrum_flux=spec, footprint=footprint, x_hr=x_hr)
 
         for i, plateifu in enumerate(plateifus):
             per_map_mse = []

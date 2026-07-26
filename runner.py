@@ -48,14 +48,25 @@ def _resolve_run_name(root: Path, run_name: str, autoinc: bool) -> str:
     return candidate
 
 
-def build_data_config(data_top: dict, *, imaging_resolution: str = "aligned") -> DataConfig:
+def build_data_config(
+    data_top: dict,
+    *,
+    imaging_resolution: str = "aligned",
+    model_top: dict | None = None,
+) -> DataConfig:
     aug = data_top.get("augmentation", {}) or {}
     split = data_top.get("split", {}) or {}
+    model_top = model_top or {}
+    use_hr_cross_attn = bool(model_top.get("use_hr_cross_attn", False))
     resolution = str(data_top.get("imaging_resolution", imaging_resolution))
+    if use_hr_cross_attn:
+        # UNet++ backbone stays on Amara 76×76; HR is a separate native stream.
+        resolution = "aligned"
     oversample_raw = data_top.get("aligned_oversample", None)
     aligned_oversample = None if oversample_raw is None else int(oversample_raw)
     grid_raw = data_top.get("imaging_grid", None)
     imaging_grid = None if grid_raw is None else str(grid_raw)
+    hr_survey = str(model_top.get("hr_survey", data_top.get("hr_survey", "sdss")))
     return DataConfig(
         data_root=Path(data_top.get("data_root", "manga_sdss_fits")),
         index_path=Path(data_top["index_path"]) if data_top.get("index_path") else None,
@@ -69,6 +80,8 @@ def build_data_config(data_top: dict, *, imaging_resolution: str = "aligned") ->
         imaging_resolution=resolution,  # type: ignore[arg-type]
         aligned_oversample=aligned_oversample,
         imaging_grid=imaging_grid,  # type: ignore[arg-type]
+        include_hr_imaging=use_hr_cross_attn,
+        hr_survey=hr_survey,  # type: ignore[arg-type]
         align_imaging_to_amara_grid=True,
         prefer_aligned_cache=bool(data_top.get("prefer_aligned_cache", True)),
         require_all=bool(data_top.get("require_all", True)),
@@ -99,9 +112,16 @@ def build_model_config(
     use_legacy = bool(data_top.get("use_legacy", False))
     use_spectrum = bool(data_top.get("use_spectrum", True))
 
+    use_hr_cross_attn = bool(model_top.get("use_hr_cross_attn", False))
+    hr_survey = str(model_top.get("hr_survey", "sdss"))
+    hr_cross_attn_levels = tuple(int(i) for i in model_top.get("hr_cross_attn_levels", (0, 1)))
+    if use_hr_cross_attn:
+        imaging_resolution = "aligned"
+
     norm_top = model_top.get("input_norm", {}) or {}
     input_norm_mode = str(norm_top.get("mode", "none"))
     imaging_asinh_scales = None
+    hr_asinh_scales = None
     spectrum_asinh_scale_fake = None
     spectrum_asinh_scale_real = None
     imaging_pct = float(norm_top.get("imaging_percentile", 99))
@@ -110,6 +130,8 @@ def build_model_config(
     if input_norm_mode == "asinh":
         from manga_prep.io.input_scales import (
             ensure_input_asinh_scales,
+            imaging_scales_for_percentile,
+            load_input_scales,
             normalize_percentile,
             resolve_runtime_asinh_scales,
         )
@@ -130,6 +152,12 @@ def build_model_config(
                 use_legacy=use_legacy,
             )
         )
+        if use_hr_cross_attn:
+            _bands, hr_asinh_scales = imaging_scales_for_percentile(
+                load_input_scales(scales_path),
+                survey=hr_survey,
+                percentile=imaging_pct,
+            )
 
     # After asinh, raw flux clamps are usually wrong — default them off unless set.
     clamp_min = model_top.get("imaging_clamp_min", -5.0)
@@ -151,6 +179,12 @@ def build_model_config(
         footprint_mode=footprint_mode,
         target_spatial_size=int(model_top.get("target_spatial_size", 76)),
         hr_project_mode=model_top.get("hr_project_mode", "bilinear"),
+        use_hr_cross_attn=use_hr_cross_attn,
+        hr_survey=hr_survey,  # type: ignore[arg-type]
+        hr_cross_attn_levels=hr_cross_attn_levels,
+        hr_encoder_n_down=int(model_top.get("hr_encoder_n_down", 3)),
+        hr_attn_heads=int(model_top.get("hr_attn_heads", 4)),
+        hr_attn_dropout=float(model_top.get("hr_attn_dropout", 0.0)),
         imaging_clamp_min=clamp_min,
         imaging_clamp_max=clamp_max,
         input_norm_mode=input_norm_mode,  # type: ignore[arg-type]
@@ -158,6 +192,7 @@ def build_model_config(
         input_norm_imaging_percentile=float(imaging_pct),
         input_norm_spectrum_percentile=float(spectrum_pct),
         imaging_asinh_scales=imaging_asinh_scales,
+        hr_asinh_scales=hr_asinh_scales,
         spectrum_asinh_scale_fake=spectrum_asinh_scale_fake,
         spectrum_asinh_scale_real=spectrum_asinh_scale_real,
         base_channels=int(model_top.get("base_channels", 64)),
@@ -202,6 +237,8 @@ def _describe_inputs(model_cfg: ModelConfig, data_cfg: DataConfig) -> str:
         parts.append(f"{model_cfg.n_sdss_bands} SDSS ({res})")
     if model_cfg.use_legacy:
         parts.append(f"{model_cfg.n_legacy_bands} Legacy")
+    if model_cfg.use_hr_cross_attn:
+        parts.append(f"HR-{model_cfg.hr_survey} cross-attn L{list(model_cfg.hr_cross_attn_levels)}")
     if model_cfg.uses_footprint_in_model():
         if model_cfg.footprint_mode == "spatial_channel":
             parts.append("footprint ch")
@@ -230,7 +267,7 @@ def _run_eval_only(args: argparse.Namespace) -> int:
     model_top = user_cfg.get("model", {})
     imaging_resolution = model_top.get("imaging_resolution", data_top.get("imaging_resolution", "aligned"))
     model_cfg = build_model_config(model_top, data_top, imaging_resolution=imaging_resolution)
-    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
+    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution, model_top=model_top)
     train_cfg = build_train_config(user_cfg.get("training", training_top), run_name=args.run_name)
 
     ckpt_path = args.checkpoint or (run_dir / "ckpts" / "best.pt")
@@ -357,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
     model_top = user_cfg.get("model", {})
     imaging_resolution = model_top.get("imaging_resolution", data_top.get("imaging_resolution", "aligned"))
     model_cfg = build_model_config(model_top, data_top, imaging_resolution=imaging_resolution)
-    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
+    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution, model_top=model_top)
 
     save_root = Path(training_top.get("logging", {}).get("root_dir", "runs/manga_maps"))
     run_name = _resolve_run_name(save_root, args.run_name, args.autoinc)
@@ -392,6 +429,12 @@ def main(argv: list[str] | None = None) -> int:
         f"deep_supervision={model_cfg.deep_supervision}"
     )
     print(f"  spatial pipe : {model_cfg.spatial_pipeline}  imaging={model_cfg.imaging_resolution} (grid={data_cfg.resolve_imaging_grid()})")
+    if model_cfg.use_hr_cross_attn:
+        print(
+            f"  HR cross-attn: survey={model_cfg.hr_survey}  "
+            f"levels={list(model_cfg.hr_cross_attn_levels)}  "
+            f"encoder_n_down={model_cfg.hr_encoder_n_down}"
+        )
     print(f"  footprint    : {model_cfg.footprint_mode}")
     print(f"  inputs       : {_describe_inputs(model_cfg, data_cfg)}")
     print(f"  losses       : {list(zip(model_cfg.losses, model_cfg.loss_weights))}")
@@ -414,6 +457,22 @@ def main(argv: list[str] | None = None) -> int:
                 f"       python -m manga_prep export-aligned-imaging --config {args.config} "
                 f"--survey sdss --skip-existing --workers 8"
             )
+        if data_cfg.include_hr_imaging and data_cfg.hr_survey == "sdss":
+            hr_counts = count_aligned_caches(
+                base_dataset.data_root,
+                base_dataset.rows,
+                oversample=1,
+                grid="sdss_native",
+            )
+            hr_cached, hr_eligible = hr_counts["sdss_cached"], hr_counts["sdss_eligible"]
+            print(f"  SDSS HR cache (sdss_native): {hr_cached:,}/{hr_eligible:,} galaxies")
+            if hr_cached < hr_eligible:
+                print(
+                    "  WARNING: missing SDSS-native HR caches → slow HR reprojection.\n"
+                    "  Pre-export with --grid sdss_native (or imaging_resolution native once):\n"
+                    f"       python -m manga_prep export-aligned-imaging --config {args.config} "
+                    f"--survey sdss --grid sdss_native --skip-existing --workers 8"
+                )
     print("=" * 60)
 
     try:

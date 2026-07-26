@@ -14,6 +14,9 @@ def _dummy_batch(cfg: ModelConfig, batch_size: int = 2) -> dict:
     inputs: dict = {}
     if cfg.use_sdss:
         inputs["sdss_imaging"] = torch.randn(batch_size, 5, img_size, img_size)
+    if cfg.use_hr_cross_attn:
+        n_hr = cfg.hr_imaging_channels()
+        inputs["hr_imaging"] = torch.randn(batch_size, n_hr, 196, 196)
     if cfg.use_spectrum:
         inputs["spectrum"] = {
             "flux": torch.randn(batch_size, cfg.spectrum_n_wave),
@@ -33,6 +36,15 @@ def main() -> int:
         dict(spatial_pipeline="hr_full", imaging_resolution="native", footprint_mode="fusion_concat"),
         dict(spatial_pipeline="hr_encoder", imaging_resolution="native", footprint_mode="loss_only"),
         dict(spatial_pipeline="hr_multiscale", imaging_resolution="native", footprint_mode="fusion_concat"),
+        dict(
+            spatial_pipeline="symmetric",
+            imaging_resolution="aligned",
+            footprint_mode="spatial_channel",
+            use_hr_cross_attn=True,
+            hr_survey="sdss",
+            hr_cross_attn_levels=(0, 1),
+            hr_encoder_n_down=2,
+        ),
     ]
     for arch in ("unet", "unetpp"):
         for head in ("single", "coarse_fine"):

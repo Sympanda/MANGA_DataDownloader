@@ -15,6 +15,7 @@ FootprintMode = Literal["spatial_channel", "fusion_concat", "loss_only"]
 HRProjectMode = Literal["bilinear", "learned"]
 SpectrumPooling = Literal["avg", "attention"]
 InputNormMode = Literal["none", "asinh"]
+HRSurvey = Literal["sdss", "legacy"]
 
 
 @dataclass
@@ -39,6 +40,14 @@ class ModelConfig:
     target_spatial_size: int = DEFAULT_TARGET_SIZE
     hr_project_mode: HRProjectMode = "bilinear"
 
+    # High-res morphology via cross-attention (side stream; backbone stays 76×76 aligned).
+    use_hr_cross_attn: bool = False
+    hr_survey: HRSurvey = "sdss"  # "sdss" → native ~196; "legacy" → Legacy HR
+    hr_cross_attn_levels: tuple[int, ...] = (0, 1)  # UNet spine indices (76, 38)
+    hr_encoder_n_down: int = 3  # 196 → ~24 token grid at deepest level
+    hr_attn_heads: int = 4
+    hr_attn_dropout: float = 0.0
+
     imaging_clamp_min: float | None = -5.0
     imaging_clamp_max: float | None = 100.0
 
@@ -50,6 +59,8 @@ class ModelConfig:
     input_norm_spectrum_percentile: float = 99.0
     # Channel order matches imaging concat: SDSS ugriz then Legacy (if enabled).
     imaging_asinh_scales: list[float] | None = None
+    # Separate HR stream scales (same physical units as the chosen hr_survey).
+    hr_asinh_scales: list[float] | None = None
     spectrum_asinh_scale_fake: float | None = None
     spectrum_asinh_scale_real: float | None = None
 
@@ -99,6 +110,13 @@ class ModelConfig:
             channels += 1
         return channels
 
+    def hr_imaging_channels(self) -> int:
+        if self.hr_survey == "sdss":
+            return self.n_sdss_bands
+        if self.hr_survey == "legacy":
+            return self.n_legacy_bands
+        raise ValueError(f"Unknown hr_survey: {self.hr_survey!r}")
+
     def imaging_input_channels(self) -> int:
         channels = 0
         if self.use_sdss:
@@ -137,8 +155,29 @@ class ModelConfig:
         if self.spatial_pipeline == "symmetric" and self.imaging_resolution == "native":
             raise ValueError(
                 "spatial_pipeline='symmetric' requires imaging_resolution='aligned'. "
-                "Use spatial_pipeline='hr_encoder', 'hr_multiscale', or 'hr_full' with native SDSS."
+                "Use spatial_pipeline='hr_encoder', 'hr_multiscale', or 'hr_full' with native SDSS, "
+                "or use_hr_cross_attn=true with aligned 76×76 backbone."
             )
+        if self.use_hr_cross_attn:
+            if self.spatial_pipeline != "symmetric":
+                raise ValueError(
+                    "use_hr_cross_attn requires spatial_pipeline='symmetric' "
+                    "(76×76 aligned backbone + HR side-stream cross-attention)."
+                )
+            if self.imaging_resolution != "aligned":
+                raise ValueError(
+                    "use_hr_cross_attn requires imaging_resolution='aligned' "
+                    "for the UNet++ backbone; HR is loaded separately."
+                )
+            levels = tuple(int(i) for i in self.hr_cross_attn_levels)
+            if not levels:
+                raise ValueError("hr_cross_attn_levels must be non-empty when use_hr_cross_attn=true")
+            if any(i < 0 or i > self.n_down for i in levels):
+                raise ValueError(
+                    f"hr_cross_attn_levels must be in [0, n_down={self.n_down}], got {levels}"
+                )
+            if self.hr_encoder_n_down < 1:
+                raise ValueError("hr_encoder_n_down must be >= 1")
         if self.spatial_pipeline == "hr_multiscale" and self.imaging_resolution != "native":
             raise ValueError(
                 "spatial_pipeline='hr_multiscale' requires imaging_resolution='native' "
@@ -180,6 +219,18 @@ class ModelConfig:
                 )
             if any(float(s) <= 0 for s in self.imaging_asinh_scales):
                 raise ValueError("imaging_asinh_scales must be > 0")
+            if self.use_hr_cross_attn:
+                if self.hr_asinh_scales is None:
+                    raise ValueError(
+                        "input_norm_mode='asinh' with use_hr_cross_attn requires hr_asinh_scales"
+                    )
+                if len(self.hr_asinh_scales) != self.hr_imaging_channels():
+                    raise ValueError(
+                        f"hr_asinh_scales length {len(self.hr_asinh_scales)} "
+                        f"!= hr channels {self.hr_imaging_channels()}"
+                    )
+                if any(float(s) <= 0 for s in self.hr_asinh_scales):
+                    raise ValueError("hr_asinh_scales must be > 0")
             if self.use_spectrum:
                 if self.spectrum_asinh_scale_fake is None or self.spectrum_asinh_scale_real is None:
                     raise ValueError(

@@ -6,7 +6,13 @@ import torch.nn.functional as F
 
 from src.models.config import ModelConfig
 from src.models.encoders import CoarseFineHead, FiLM2d, SpectrumEncoder
-from src.models.hr_pipeline import FootprintFusion, GridProjector, HREncoder, HRLevelFusion
+from src.models.hr_pipeline import (
+    CrossAttnHRBlock,
+    FootprintFusion,
+    GridProjector,
+    HREncoder,
+    HRLevelFusion,
+)
 from src.models.unet import UNetBackbone
 from src.models.unetpp import UNetPPBackbone
 
@@ -57,10 +63,32 @@ class ConditionalMapModel(nn.Module):
             backbone_out = config.n_target_maps
 
         self.hr_encoder: HREncoder | None = None
+        self.hr_cross_encoder: HREncoder | None = None
+        self.hr_cross_blocks: nn.ModuleDict | None = None
         self.grid_projector: GridProjector | None = None
         self.hr_fusions: nn.ModuleList | None = None
         self.footprint_fusion: FootprintFusion | None = None
         self._hr_pyramid: list[torch.Tensor] | None = None
+        self._hr_cross_feat: torch.Tensor | None = None
+
+        if config.use_hr_cross_attn:
+            self.hr_cross_encoder = HREncoder(
+                config.hr_imaging_channels(),
+                base_channels=config.base_channels,
+                n_down=config.hr_encoder_n_down,
+                dropout=config.dropout,
+                norm=config.norm,
+            )
+            unet_channels = self._encoder_level_channels_preview(config)
+            blocks: dict[str, CrossAttnHRBlock] = {}
+            for level in config.hr_cross_attn_levels:
+                blocks[str(int(level))] = CrossAttnHRBlock(
+                    unet_channels[int(level)],
+                    self.hr_cross_encoder.out_channels,
+                    num_heads=config.hr_attn_heads,
+                    dropout=config.hr_attn_dropout,
+                )
+            self.hr_cross_blocks = nn.ModuleDict(blocks)
 
         if config.spatial_pipeline in ("hr_encoder", "hr_multiscale"):
             self.hr_encoder = HREncoder(
@@ -209,6 +237,19 @@ class ConditionalMapModel(nn.Module):
         raise ValueError(f"Unknown spatial_pipeline: {cfg.spatial_pipeline!r}")
 
     def _hr_level_fusions(self) -> list | None:
+        if self.hr_cross_blocks is not None and self._hr_cross_feat is not None:
+            hr = self._hr_cross_feat
+            n = self.config.n_down + 1
+            fusions: list = [None] * n
+            for key, block in self.hr_cross_blocks.items():
+                level = int(key)
+
+                def _fn(unet_h: torch.Tensor, block=block, hr=hr) -> torch.Tensor:
+                    return block(unet_h, hr)
+
+                fusions[level] = _fn
+            return fusions
+
         if self.hr_fusions is None or self._hr_pyramid is None:
             return None
         pyramid = self._hr_pyramid
@@ -359,12 +400,20 @@ class ConditionalMapModel(nn.Module):
         spectrum: torch.Tensor | None = None,
         spectrum_flux: torch.Tensor | None = None,
         footprint: torch.Tensor | None = None,
+        x_hr: torch.Tensor | None = None,
         detail_scale_multiplier: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         spec = spectrum if spectrum is not None else spectrum_flux
         cond = None
         if self.spectrum_encoder is not None and spec is not None:
             cond = self.spectrum_encoder(spec)
+
+        self._hr_cross_feat = None
+        if self.config.use_hr_cross_attn:
+            if x_hr is None:
+                raise ValueError("use_hr_cross_attn=true requires x_hr in forward()")
+            assert self.hr_cross_encoder is not None
+            self._hr_cross_feat = self.hr_cross_encoder(x_hr)
 
         x_backbone = self._prepare_backbone_input(x_imaging, footprint)
 

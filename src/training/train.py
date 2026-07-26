@@ -176,7 +176,7 @@ class Trainer:
         # nested tensors
         if "inputs" in batch:
             inputs = batch["inputs"]
-            for key in ("sdss_imaging", "legacy_imaging"):
+            for key in ("sdss_imaging", "legacy_imaging", "hr_imaging"):
                 if key in inputs:
                     inputs[key] = inputs[key].to(self.device)
             if "spectrum" in inputs:

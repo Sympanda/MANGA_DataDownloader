@@ -46,6 +46,30 @@ def prepare_imaging_input(batch: dict[str, object], config: ModelConfig) -> torc
     return x
 
 
+def prepare_hr_imaging_input(batch: dict[str, object], config: ModelConfig) -> torch.Tensor | None:
+    """High-res morphology stream for cross-attention (not resized onto the UNet grid)."""
+    if not config.use_hr_cross_attn:
+        return None
+    inputs = batch.get("inputs", {})
+    if "hr_imaging" not in inputs:  # type: ignore[operator]
+        raise KeyError("Batch missing inputs['hr_imaging'] required by use_hr_cross_attn")
+    x = _nan_to_num(inputs["hr_imaging"].float())  # type: ignore[index]
+    if config.input_norm_mode == "asinh":
+        if config.hr_asinh_scales is None:
+            raise ValueError("input_norm_mode='asinh' but hr_asinh_scales is unset")
+        scales = torch.tensor(
+            config.hr_asinh_scales,
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, -1, 1, 1)
+        x = torch.asinh(x / scales)
+    if config.imaging_clamp_min is not None or config.imaging_clamp_max is not None:
+        lo = config.imaging_clamp_min if config.imaging_clamp_min is not None else -float("inf")
+        hi = config.imaging_clamp_max if config.imaging_clamp_max is not None else float("inf")
+        x = torch.clamp(x, min=lo, max=hi)
+    return x
+
+
 def prepare_footprint_input(batch: dict[str, object], config: ModelConfig) -> torch.Tensor | None:
     if not config.uses_footprint_in_model():
         return None
@@ -190,6 +214,7 @@ class MapGenerator(nn.Module):
         epoch: int | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         x = prepare_imaging_input(batch, self.config)
+        x_hr = prepare_hr_imaging_input(batch, self.config)
         footprint = prepare_footprint_input(batch, self.config)
         spec = prepare_spectrum_input(batch, self.config)
         targets, masks = prepare_targets_and_masks(batch, self.config)
@@ -199,6 +224,7 @@ class MapGenerator(nn.Module):
             x,
             spectrum=spec,
             footprint=footprint,
+            x_hr=x_hr,
             detail_scale_multiplier=detail_mult,
         )
         # Losses in fp32 — avoids AMP overflow (especially integration / grad terms).

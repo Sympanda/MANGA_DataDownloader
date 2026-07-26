@@ -107,7 +107,7 @@ def _train_member(
     model_top = cfg.get("model", {})
     imaging_resolution = model_top.get("imaging_resolution", data_top.get("imaging_resolution", "aligned"))
     model_cfg = build_model_config(model_top, data_top, imaging_resolution=imaging_resolution)
-    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
+    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution, model_top=model_top)
     train_cfg = build_train_config(training_top, run_name=member_run)
 
     set_seed(member_seed)
@@ -159,7 +159,7 @@ def _run_ensemble_eval(
     base_split_csv = Path(
         ensemble_top.get("base_split_csv", data_top.get("split", {}).get("split_csv_path"))
     )
-    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
+    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution, model_top=model_top)
     data_cfg.split_csv_path = base_split_csv
     train_cfg = build_train_config(training_top, run_name=ensemble_name)
     if eval_max_plot is not None:

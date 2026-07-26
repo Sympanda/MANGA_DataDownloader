@@ -175,11 +175,16 @@ def discover_run(save_root: Path, run_name: str) -> RunContext:
 
 def _build_dataloader(ctx: RunContext, *, split: str, batch_size: int) -> DataLoader:
     data_top = dict(ctx.user_cfg.get("data", {}))
+    model_top = ctx.user_cfg.get("model", {})
     ensemble_top = ctx.user_cfg.get("ensemble", {})
     if ctx.is_ensemble:
         base_csv = ensemble_top.get("base_split_csv") or data_top.get("split", {}).get("split_csv_path")
         data_top.setdefault("split", {})["split_csv_path"] = base_csv
-    data_cfg = build_data_config(data_top, imaging_resolution=ctx.model_cfg.imaging_resolution)
+    data_cfg = build_data_config(
+        data_top,
+        imaging_resolution=ctx.model_cfg.imaging_resolution,
+        model_top=model_top,
+    )
     data_cfg.augmentation.enabled = False
     _, dl_val, dl_test, _ = make_manga_dataloaders(
         data_cfg,
@@ -221,14 +226,19 @@ def _forward_member(
     batch: dict,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    from src.models.wrapper import prepare_hr_imaging_input
+
     x = prepare_imaging_input(batch, model.config).to(device)
+    x_hr = prepare_hr_imaging_input(batch, model.config)
+    if x_hr is not None:
+        x_hr = x_hr.to(device)
     footprint = prepare_footprint_input(batch, model.config)
     if footprint is not None:
         footprint = footprint.to(device)
     spec = prepare_spectrum_input(batch, model.config)
     if spec is not None:
         spec = spec.to(device)
-    pred, aux = model.model(x, spectrum_flux=spec, footprint=footprint)
+    pred, aux = model.model(x, spectrum_flux=spec, footprint=footprint, x_hr=x_hr)
     sigma = aux.get("sigma") if isinstance(aux, dict) else None
     return pred, sigma
 
@@ -237,7 +247,7 @@ def _move_batch(batch: dict, device: torch.device) -> dict:
     out = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
     if "inputs" in batch:
         inputs = dict(batch["inputs"])
-        for key in ("sdss_imaging", "legacy_imaging"):
+        for key in ("sdss_imaging", "legacy_imaging", "hr_imaging"):
             if key in inputs:
                 inputs[key] = inputs[key].to(device)
         if "spectrum" in inputs:

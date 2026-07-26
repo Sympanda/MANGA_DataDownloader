@@ -53,12 +53,14 @@
     "use_spectrum": true,
     "use_footprint_mask": true,
 
-    // Imaging grid (always WCS-aligned in the dataloader):
+    // Imaging grid for the UNet++ backbone (always WCS-aligned in the dataloader):
     //   "aligned" → Amara FoV / orientation at 76×76 (sdss_aligned.npz)
-    //   "native"  → SDSS plate scale on ~196×196, Amara-oriented (sdss_aligned_native.npz)
-    // Pre-export for speed:
+    //   "native"  → SDSS plate scale on ~196×196 as the *backbone* (legacy HR pipelines)
+    // With use_hr_cross_attn, backbone is forced to "aligned"; HR uses sdss_aligned_native.npz.
+    // Pre-export for speed (both grids when using HR cross-attn):
     //   python -m manga_prep export-aligned-imaging --config config.jsonc --survey sdss --skip-existing --workers 8
-    "imaging_resolution": "native",
+    //   python -m manga_prep export-aligned-imaging --config config.jsonc --survey sdss --grid sdss_native --skip-existing --workers 8
+    "imaging_resolution": "aligned",
 
     "spectrum_mode": "fake",
     "spectrum_fallback": true,
@@ -85,12 +87,24 @@
     "architecture": "unetpp",
     "output_head": "single",
 
-    // --- Spatial pipeline (v8 symmetric baseline) ---
-    "imaging_resolution": "native",
-    "spatial_pipeline": "hr_multiscale",
-    "footprint_mode": "fusion_concat",
+    // --- Spatial pipeline ---
+    // Backbone: aligned 76×76 ugriz → UNet++ → 76×76 maps
+    // Spectrum: FiLM (global)
+    // HR: optional cross-attention morphology stream (not resize+concat)
+    "imaging_resolution": "aligned",
+    "spatial_pipeline": "symmetric",
+    "footprint_mode": "spatial_channel",
     "target_spatial_size": 76,
     "hr_project_mode": "bilinear",
+
+    // High-res morphology via cross-attention (ablation: set false).
+    // HR survey: "sdss" (~196 native) or "legacy" (DECaLS/Legacy at native grid).
+    "use_hr_cross_attn": true,
+    "hr_survey": "sdss",
+    "hr_cross_attn_levels": [0, 1],
+    "hr_encoder_n_down": 3,
+    "hr_attn_heads": 4,
+    "hr_attn_dropout": 0.0,
 
     // Raw flux clamp (legacy). Prefer null when using asinh input_norm.
     "imaging_clamp_min": null,
@@ -134,11 +148,12 @@
     "deep_supervision_weights": [0.05, 0.10, 0.15],
     "deep_supervision_loss": "l1",
 
-    // --- Spatial pipeline notes (Task 4) ---
-    // symmetric + aligned  = encode 76×76 Amara-aligned imaging (Model B/C)
-    // hr_multiscale+native = multi-scale HR on SDSS-native ~196 (Amara-oriented) (Model D/E)
-    //   requires: imaging_resolution "native", footprint_mode "fusion_concat" or "loss_only"
-    //   dataloader always WCS-aligns; "native" = SDSS plate scale, not Amara×2
+    // --- Spatial pipeline notes ---
+    // symmetric + aligned  = 76×76 Amara-aligned backbone (Model B/C)
+    // use_hr_cross_attn    = HR morphology as K/V tokens → cross-attn into shallow UNet levels
+    //   requires: imaging_resolution "aligned", spatial_pipeline "symmetric"
+    //   HR loaded separately (sdss_native or Legacy); not resized onto the UNet grid
+    // hr_multiscale+native = legacy concat-fuse path (kept for ablation / old runs)
     // hr_encoder / hr_full = legacy single-bottleneck / full-res paths
 
     // --- Coarse/fine head (disabled when deep_supervision=true; use output_head="single") ---

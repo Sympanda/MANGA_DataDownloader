@@ -195,6 +195,8 @@ class MangaGalaxyDataset(Dataset):
         imaging_grid: ImagingGrid = "amara",
         aligned_oversample: int = 1,
         write_aligned_cache: bool = True,
+        include_hr_imaging: bool = False,
+        hr_survey: Literal["sdss", "legacy"] = "sdss",
         rebuild_index: bool = False,
     ) -> None:
         self.data_root = Path(data_root)
@@ -213,6 +215,15 @@ class MangaGalaxyDataset(Dataset):
             raise ValueError(f"imaging_grid must be 'amara' or 'sdss_native', got {imaging_grid!r}")
         self.aligned_oversample = int(aligned_oversample)
         self.write_aligned_cache = bool(write_aligned_cache)
+        self.include_hr_imaging = bool(include_hr_imaging)
+        self.hr_survey = hr_survey
+        if self.hr_survey not in ("sdss", "legacy"):
+            raise ValueError(f"hr_survey must be 'sdss' or 'legacy', got {hr_survey!r}")
+        if self.include_hr_imaging and self.imaging_grid != "amara":
+            raise ValueError(
+                "include_hr_imaging requires imaging_grid='amara' "
+                "(76×76 backbone + separate HR stream)."
+            )
         if self.imaging_grid == "sdss_native":
             self.aligned_oversample = 1
         if self.aligned_oversample < 1:
@@ -270,6 +281,11 @@ class MangaGalaxyDataset(Dataset):
             filtered = [row for row in filtered if sdss_imaging_ready(self.data_root, row)]
         if self.include_legacy_imaging:
             filtered = [row for row in filtered if legacy_imaging_ready(self.data_root, row)]
+        if self.include_hr_imaging:
+            if self.hr_survey == "sdss":
+                filtered = [row for row in filtered if sdss_imaging_ready(self.data_root, row)]
+            else:
+                filtered = [row for row in filtered if legacy_imaging_ready(self.data_root, row)]
         return filtered
 
     def __len__(self) -> int:
@@ -417,6 +433,30 @@ class MangaGalaxyDataset(Dataset):
                 )
         raise FileNotFoundError(f"No consistent legacy imaging for {row['plateifu']}")
 
+    def _with_imaging_grid(self, grid: ImagingGrid, oversample: int = 1):
+        """Temporarily switch imaging grid for a nested load."""
+        prev_grid = self.imaging_grid
+        prev_os = self.aligned_oversample
+        self.imaging_grid = grid
+        self.aligned_oversample = 1 if grid == "sdss_native" else int(oversample)
+        return prev_grid, prev_os
+
+    def _load_hr_imaging(self, row: dict) -> dict[str, object]:
+        """Load high-res morphology stream (SDSS-native or Legacy native)."""
+        prev_grid, prev_os = self._with_imaging_grid("sdss_native", oversample=1)
+        try:
+            if self.hr_survey == "sdss":
+                bundle = self._load_sdss_imaging(row)
+            else:
+                bundle = self._load_legacy_imaging(row)
+        finally:
+            self.imaging_grid = prev_grid
+            self.aligned_oversample = prev_os
+        bundle = dict(bundle)
+        bundle["grid"] = "sdss_native"
+        bundle["hr_survey"] = self.hr_survey
+        return bundle
+
     def _load_spectrum(self, row: dict) -> dict[str, object]:
         if self.spectrum is None:
             raise RuntimeError("_load_spectrum called with spectrum=None")
@@ -477,6 +517,8 @@ class MangaGalaxyDataset(Dataset):
             inputs["sdss_imaging"] = self._load_sdss_imaging(row)
         if self.include_legacy_imaging:
             inputs["legacy_imaging"] = self._load_legacy_imaging(row)
+        if self.include_hr_imaging:
+            inputs["hr_imaging"] = self._load_hr_imaging(row)
         if self.spectrum is not None:
             inputs["spectrum"] = self._load_spectrum(row)
         if inputs:
@@ -529,7 +571,7 @@ def collate_manga_batch(batch: list[dict[str, object]]) -> dict[str, object]:
     if "inputs" in batch[0]:
         inputs: dict[str, object] = {}
         first_inputs = batch[0]["inputs"]
-        for key in ("sdss_imaging", "legacy_imaging"):
+        for key in ("sdss_imaging", "legacy_imaging", "hr_imaging"):
             if key in first_inputs:
                 inputs[key] = torch.from_numpy(
                     np.stack([item["inputs"][key]["data"] for item in batch], axis=0)

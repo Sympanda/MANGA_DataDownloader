@@ -8,6 +8,7 @@ from src.models.config import ModelConfig, effective_detail_scale_multiplier
 from src.models.losses import compose_map_losses
 from src.models.wrapper import (
     prepare_footprint_input,
+    prepare_hr_imaging_input,
     prepare_imaging_input,
     prepare_spectrum_input,
     prepare_targets_and_masks,
@@ -33,6 +34,7 @@ class UncertaintyMapGenerator(nn.Module):
         epoch: int | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         x = prepare_imaging_input(batch, self.config)
+        x_hr = prepare_hr_imaging_input(batch, self.config)
         footprint = prepare_footprint_input(batch, self.config)
         spec = prepare_spectrum_input(batch, self.config)
         targets, masks = prepare_targets_and_masks(batch, self.config)
@@ -42,6 +44,7 @@ class UncertaintyMapGenerator(nn.Module):
             x,
             spectrum=spec,
             footprint=footprint,
+            x_hr=x_hr,
             detail_scale_multiplier=detail_mult,
         )
         log_var = aux["log_var"]

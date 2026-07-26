@@ -48,7 +48,7 @@ def _run_eval_only(args: argparse.Namespace) -> int:
     model_top = user_cfg.get("model", {})
     imaging_resolution = model_top.get("imaging_resolution", data_top.get("imaging_resolution", "aligned"))
     model_cfg = build_model_config(model_top, data_top, imaging_resolution=imaging_resolution)
-    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
+    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution, model_top=model_top)
     train_cfg = build_train_config(user_cfg.get("training", training_top), run_name=args.run_name)
 
     ckpt_path = args.checkpoint or (run_dir / "ckpts" / "best.pt")
@@ -132,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
 
     imaging_resolution = model_top.get("imaging_resolution", data_top.get("imaging_resolution", "aligned"))
     model_cfg = build_model_config(model_top, data_top, imaging_resolution=imaging_resolution)
-    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
+    data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution, model_top=model_top)
 
     save_root = Path(training_top.get("logging", {}).get("root_dir", "runs/manga_maps"))
     run_name = _resolve_run_name(save_root, args.run_name, args.autoinc)

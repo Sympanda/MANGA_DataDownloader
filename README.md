@@ -33,9 +33,10 @@ The model and dataloader support three spatial pipelines. Change only `config.js
 | `spatial_pipeline` | `imaging_resolution` | Description |
 |--------------------|----------------------|-------------|
 | `symmetric` | `aligned` | **Default.** 76×76 WCS-aligned SDSS + footprint channel → UNet/UNet++ → 76×76 maps |
+| `symmetric` + `use_hr_cross_attn` | `aligned` | Same backbone; HR (SDSS-native / Legacy) conditions shallow levels via cross-attention |
 | `hr_encoder` | `native` | SDSS-native ~196×196 (Amara-oriented) → HR encoder → project to 76×76 → footprint fusion → decoder |
 | `hr_full` | `native` | Full UNet/UNet++ on SDSS-native imaging → resize predictions to 76×76 |
-| `hr_multiscale` | `native` | HR pyramid fused into every UNet encoder level |
+| `hr_multiscale` | `native` | HR pyramid fused into every UNet encoder level (legacy concat path) |
 
 | `footprint_mode` | When to use |
 |------------------|-------------|
@@ -46,23 +47,30 @@ The model and dataloader support three spatial pipelines. Change only `config.js
 **Config presets** (set in both `data` and `model`, or just `model` — `runner.py` merges them):
 
 ```jsonc
-// Current default (76×76 aligned)
+// Current default: 76×76 backbone + HR cross-attention
 "imaging_resolution": "aligned",
 "spatial_pipeline": "symmetric",
-"footprint_mode": "spatial_channel"
+"footprint_mode": "spatial_channel",
+"use_hr_cross_attn": true,
+"hr_survey": "sdss",
+"hr_cross_attn_levels": [0, 1]
 
-// HR multi-scale (SDSS-native plate scale; still WCS-aligned in the dataloader)
+// Ablation without HR
+"use_hr_cross_attn": false
+
+// Legacy HR multi-scale concat (SDSS-native as backbone)
 "imaging_resolution": "native",
 "spatial_pipeline": "hr_multiscale",
 "footprint_mode": "fusion_concat",
-"hr_project_mode": "bilinear"   // or "learned"
+"use_hr_cross_attn": false
 ```
 
 **Notes:**
-- Ground-truth maps are only defined at **76×76** (~0.5″/pix on the Pipe3D grid). HR pipelines preserve SDSS native detail in the encoder; loss is always on the MaNGA grid.
-- **WCS alignment always happens in the dataloader** before the model. `native` means SDSS plate scale @ ~196×196 (Amara-oriented), not an Amara×2 grid and not raw camera frames.
-- Imaging/spectrum soft-norm: `asinh(f/s_b)` from train-split percentiles (auto-computed on first train if missing). Pick `95` / `99` / `99.5` in `model.input_norm`.
-- Eval plots show whatever SDSS resolution the dataloader feeds (76 Amara-aligned or ~196 SDSS-native).
+- Ground-truth maps are only defined at **76×76** (~0.5″/pix on the Pipe3D grid).
+- With HR cross-attention, the UNet never sees resized HR pixels: HR is encoded to spatial tokens (K/V) and queried by shallow UNet features.
+- **WCS alignment always happens in the dataloader** before the model. Pre-export both `sdss_aligned.npz` and `sdss_aligned_native.npz` when using HR cross-attn.
+- Imaging/spectrum soft-norm: `asinh(f/s_b)` from train-split percentiles (auto-computed on first train if missing).
+- Eval plots show the 76×76 backbone imaging; HR is an auxiliary stream.
 
 ## Project layout
 

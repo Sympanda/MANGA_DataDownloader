@@ -216,12 +216,16 @@ def plot_uncertainty_map_panel(
 def _forward_uncertainty_batch(model, batch, device):
     from src.models.wrapper import (
         prepare_footprint_input,
+        prepare_hr_imaging_input,
         prepare_imaging_input,
         prepare_spectrum_input,
         prepare_targets_and_masks,
     )
 
     x = prepare_imaging_input(batch, model.config).to(device)
+    x_hr = prepare_hr_imaging_input(batch, model.config)
+    if x_hr is not None:
+        x_hr = x_hr.to(device)
     footprint = prepare_footprint_input(batch, model.config)
     if footprint is not None:
         footprint = footprint.to(device)
@@ -231,7 +235,7 @@ def _forward_uncertainty_batch(model, batch, device):
     targets, masks = prepare_targets_and_masks(batch, model.config)
     targets = targets.to(device)
     masks = masks.to(device)
-    pred, aux = model.model(x, spectrum_flux=spec, footprint=footprint)
+    pred, aux = model.model(x, spectrum_flux=spec, footprint=footprint, x_hr=x_hr)
     sigma = aux["sigma"]
     return pred, sigma, targets, masks, batch
 

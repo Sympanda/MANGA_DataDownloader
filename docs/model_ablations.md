@@ -16,9 +16,13 @@ See also: recommended experiment order in the architecture-fix notes (B → C �
 | `model.spectrum_use_wavelength` | same | `true` / `false` | λ_norm channel |
 | `model.spectrum_use_ivar` | same | `true` / `false` | log1p(ivar) channel |
 | `model.spatial_pipeline` | same | see below | Imaging path |
-| `model.imaging_resolution` + `data.imaging_resolution` | both | `aligned` / `native` | Must match |
+| `model.imaging_resolution` + `data.imaging_resolution` | both | `aligned` / `native` | Must match; both are **WCS-aligned in the dataloader** |
+| `data.aligned_oversample` | `data` | int / omit | Pixel oversample on Amara FoV (`native` defaults to 2) |
 
 Keep **`data.imaging_resolution`** and **`model.imaging_resolution`** the same.
+
+**Alignment is always done in the dataloader.** `aligned` = 1× Amara canvas (76×76).
+`native` = SDSS plate scale on a ~196×196 Amara-oriented canvas (not Amara×2, not raw camera frames).
 
 ---
 
@@ -61,11 +65,11 @@ Defaults in `config.jsonc` already enable C on top of B.
 
 ---
 
-## Model D — multi-scale native SDSS (from B)
+## Model D — multi-scale HR SDSS (from B)
 
-Encode **native** ugriz, build an HR feature pyramid, project each level onto the
-76×76 UNet++ encoder spine (concat + conv fuse). Do **not** resample raw imaging
-to 76×76 before the HR encoder.
+Encode **SDSS-native** ugriz (~196×196 at survey plate scale, WCS-aligned to Amara
+orientation/center), build an HR feature pyramid, and project each level onto the
+76×76 UNet++ encoder spine (concat + conv fuse).
 
 ```jsonc
 "imaging_resolution": "native",   // also set data.imaging_resolution
@@ -76,7 +80,7 @@ to 76×76 before the HR encoder.
 "spectrum_use_ivar": false
 ```
 
-Geometric aug is disabled automatically for native imaging in `runner.py`.
+Geometric aug stays enabled: imaging and maps share Amara sky orientation.
 
 ```powershell
 python runner.py --config config.jsonc --run-name model_d_hr_ms --autoinc

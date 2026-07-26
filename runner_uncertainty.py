@@ -134,10 +134,6 @@ def main(argv: list[str] | None = None) -> int:
     model_cfg = build_model_config(model_top, data_top, imaging_resolution=imaging_resolution)
     data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
 
-    if model_cfg.imaging_resolution == "native" and data_cfg.augmentation.enabled:
-        print("  note: disabling geometric augmentation for native-resolution SDSS.", flush=True)
-        data_cfg.augmentation.enabled = False
-
     save_root = Path(training_top.get("logging", {}).get("root_dir", "runs/manga_maps"))
     run_name = _resolve_run_name(save_root, args.run_name, args.autoinc)
     train_cfg = build_train_config(training_top, run_name=run_name)

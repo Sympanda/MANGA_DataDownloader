@@ -55,6 +55,42 @@ class NativeImagingStackTests(unittest.TestCase):
         np.testing.assert_array_equal(stack[2, 34:162, 34:162], cropped_r)
 
 
+class AlignmentPolicyTests(unittest.TestCase):
+    def test_align_false_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            MangaGalaxyDataset(
+                DATA_ROOT if DATA_ROOT.is_dir() else Path("."),
+                INDEX_PATH if INDEX_PATH.is_file() else None,
+                include_sdss_imaging=False,
+                include_targets=False,
+                spectrum=None,
+                require_all=False,
+                align_imaging_to_amara_grid=False,
+                rebuild_index=False,
+            )
+
+    def test_amara_oversample_shapes(self) -> None:
+        from manga_prep.io.imaging_alignment import amara_aligned_pixel_shape
+        from manga_prep.io.aligned_cache import aligned_sdss_path
+
+        self.assertEqual(amara_aligned_pixel_shape((76, 76), oversample=1), (76, 76))
+        self.assertEqual(amara_aligned_pixel_shape((76, 76), oversample=2), (152, 152))
+        self.assertEqual(aligned_sdss_path("x", grid="amara").name, "sdss_aligned.npz")
+        self.assertEqual(aligned_sdss_path("x", grid="sdss_native").name, "sdss_aligned_native.npz")
+
+    def test_data_config_grid_defaults(self) -> None:
+        from src.data.make_dataloader import DataConfig
+
+        self.assertEqual(DataConfig(imaging_resolution="aligned").resolve_imaging_grid(), "amara")
+        self.assertEqual(DataConfig(imaging_resolution="native").resolve_imaging_grid(), "sdss_native")
+        self.assertEqual(DataConfig(imaging_resolution="aligned").resolve_aligned_oversample(), 1)
+        self.assertEqual(DataConfig(imaging_resolution="native").resolve_aligned_oversample(), 1)
+        self.assertEqual(
+            DataConfig(imaging_resolution="aligned", aligned_oversample=3).resolve_aligned_oversample(),
+            3,
+        )
+
+
 def _ensure_index() -> None:
     if not INDEX_PATH.is_file():
         rows = build_manga_dataset_index(DATA_ROOT)
@@ -87,7 +123,25 @@ class MangaDatasetTests(unittest.TestCase):
         self.assertEqual(sample["targets"]["ha_flux"].shape, (76, 76))
         self.assertEqual(sample["inputs"]["sdss_imaging"]["data"].shape, (5, 76, 76))
         self.assertTrue(sample["inputs"]["sdss_imaging"]["aligned_to_amara_grid"])
+        self.assertEqual(sample["inputs"]["sdss_imaging"].get("aligned_oversample", 1), 1)
         self.assertEqual(sample["footprint_mask"].shape, (76, 76))
+
+    def test_oversampled_imaging_still_aligned(self) -> None:
+        dataset = MangaGalaxyDataset(
+            DATA_ROOT,
+            INDEX_PATH,
+            include_sdss_imaging=True,
+            include_targets=True,
+            spectrum=None,
+            require_all=True,
+            prefer_aligned_cache=False,
+            imaging_grid="sdss_native",
+        )
+        sample = dataset[0]
+        self.assertEqual(sample["inputs"]["sdss_imaging"]["data"].shape, (5, 196, 196))
+        self.assertTrue(sample["inputs"]["sdss_imaging"]["aligned_to_amara_grid"])
+        self.assertEqual(sample["inputs"]["sdss_imaging"].get("grid"), "sdss_native")
+        self.assertEqual(sample["targets"]["ha_flux"].shape, (76, 76))
 
     def test_spectrum_none_excludes_spectrum(self) -> None:
         dataset = MangaGalaxyDataset(

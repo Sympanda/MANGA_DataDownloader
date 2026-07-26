@@ -26,6 +26,7 @@ from manga_prep.download.sdss_spectra import main as download_sdss_spectra
 from manga_prep.export.aligned_imaging import main as export_aligned_imaging
 from manga_prep.export.aperture_spectra import main as export_aperture_spectra
 from manga_prep.export.build_index import main as build_index
+from manga_prep.export.compute_input_scales import main as compute_input_scales
 from manga_prep.export.inventory import main as inventory
 from manga_prep.export.manga_spectra import main as export_manga_spectra
 from manga_prep.export.pipe3d_maps import main as export_pipe3d_maps
@@ -46,6 +47,7 @@ COMMANDS: dict[str, tuple[Callable, str]] = {
     "export-aperture-spectra": (export_aperture_spectra, "Fake SDSS-like aperture spectra from LOGCUBE"),
     "export-manga-spectra": (export_manga_spectra, "Full IFU spaxel cubes (not used by UNet)"),
     "export-aligned-imaging": (export_aligned_imaging, "Pre-align SDSS/Legacy to Amara grid"),
+    "compute-input-scales": (compute_input_scales, "Train-split asinh soft scales for imaging + spectra"),
     "build-index": (build_index, "Build manga_dataset_index.csv"),
     "inventory": (inventory, "Completeness report for local galaxy folders"),
     "validate-sdss-cutouts": (validate_sdss_cutouts, "Check ugriz FITS band shape / metadata consistency"),

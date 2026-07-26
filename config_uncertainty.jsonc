@@ -82,8 +82,16 @@
     "target_spatial_size": 76,
     "hr_project_mode": "bilinear",
 
-    "imaging_clamp_min": -5.0,
-    "imaging_clamp_max": 100.0,
+    "imaging_clamp_min": null,
+    "imaging_clamp_max": null,
+
+    "input_norm": {
+      "mode": "asinh",
+      "scales_path": "manga_sdss_fits/stats/input_asinh_scales.json",
+      "auto_compute": true,
+      "imaging_percentile": 99,
+      "spectrum_percentile": 99
+    },
 
     "base_channels": 64,
     "bottleneck_multiplier": 16,

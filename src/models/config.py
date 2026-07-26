@@ -14,6 +14,7 @@ SpatialPipeline = Literal["symmetric", "hr_encoder", "hr_full", "hr_multiscale"]
 FootprintMode = Literal["spatial_channel", "fusion_concat", "loss_only"]
 HRProjectMode = Literal["bilinear", "learned"]
 SpectrumPooling = Literal["avg", "attention"]
+InputNormMode = Literal["none", "asinh"]
 
 
 @dataclass
@@ -40,6 +41,17 @@ class ModelConfig:
 
     imaging_clamp_min: float | None = -5.0
     imaging_clamp_max: float | None = 100.0
+
+    # Input soft-normalization: asinh(f / s_b) with train-split percentile scales.
+    # scales_path is resolved in runner → imaging_asinh_scales / spectrum_* filled.
+    input_norm_mode: InputNormMode = "none"
+    input_norm_scales_path: str | None = None
+    input_norm_imaging_percentile: float = 99.0
+    input_norm_spectrum_percentile: float = 99.0
+    # Channel order matches imaging concat: SDSS ugriz then Legacy (if enabled).
+    imaging_asinh_scales: list[float] | None = None
+    spectrum_asinh_scale_fake: float | None = None
+    spectrum_asinh_scale_real: float | None = None
 
     base_channels: int = 64
     bottleneck_multiplier: int = 16
@@ -154,6 +166,28 @@ class ModelConfig:
                         f"deep_supervision_weights must have length n_down-1={expected}, "
                         f"got {len(self.deep_supervision_weights)}"
                     )
+        if self.input_norm_mode == "asinh":
+            if self.imaging_asinh_scales is None:
+                raise ValueError(
+                    "input_norm_mode='asinh' requires imaging_asinh_scales "
+                    "(load via input_norm.scales_path in config / runner)."
+                )
+            n_img = self.imaging_input_channels()
+            if len(self.imaging_asinh_scales) != n_img:
+                raise ValueError(
+                    f"imaging_asinh_scales length {len(self.imaging_asinh_scales)} "
+                    f"!= imaging channels {n_img}"
+                )
+            if any(float(s) <= 0 for s in self.imaging_asinh_scales):
+                raise ValueError("imaging_asinh_scales must be > 0")
+            if self.use_spectrum:
+                if self.spectrum_asinh_scale_fake is None or self.spectrum_asinh_scale_real is None:
+                    raise ValueError(
+                        "input_norm_mode='asinh' with use_spectrum requires "
+                        "spectrum_asinh_scale_fake and spectrum_asinh_scale_real"
+                    )
+                if float(self.spectrum_asinh_scale_fake) <= 0 or float(self.spectrum_asinh_scale_real) <= 0:
+                    raise ValueError("spectrum asinh scales must be > 0")
 
     def resolved_deep_supervision_weights(self) -> list[float]:
         """Weights for auxiliary DS heads (excludes deepest, which uses the full loss)."""

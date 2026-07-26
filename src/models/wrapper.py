@@ -30,6 +30,15 @@ def prepare_imaging_input(batch: dict[str, object], config: ModelConfig) -> torc
     if not parts:
         raise ValueError("No spatial imaging found in batch.")
     x = torch.cat(parts, dim=1)
+    if config.input_norm_mode == "asinh":
+        if config.imaging_asinh_scales is None:
+            raise ValueError("input_norm_mode='asinh' but imaging_asinh_scales is unset")
+        scales = torch.tensor(
+            config.imaging_asinh_scales,
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, -1, 1, 1)
+        x = torch.asinh(x / scales)
     if config.imaging_clamp_min is not None or config.imaging_clamp_max is not None:
         lo = config.imaging_clamp_min if config.imaging_clamp_min is not None else -float("inf")
         hi = config.imaging_clamp_max if config.imaging_clamp_max is not None else float("inf")
@@ -68,6 +77,27 @@ def prepare_spectrum_input(batch: dict[str, object], config: ModelConfig) -> tor
     inputs = batch.get("inputs", {})
     spec = inputs["spectrum"]  # type: ignore[index]
     flux = _nan_to_num(spec["flux"].float())  # type: ignore[index]
+
+    if config.input_norm_mode == "asinh":
+        s_fake = config.spectrum_asinh_scale_fake
+        s_real = config.spectrum_asinh_scale_real
+        if s_fake is None or s_real is None:
+            raise ValueError("input_norm_mode='asinh' but spectrum asinh scales are unset")
+        is_real = spec.get("is_real_sdss_fiber")  # type: ignore[union-attr]
+        if is_real is None:
+            scale = float(s_fake)
+            flux = torch.asinh(flux / scale)
+        else:
+            is_real_t = is_real.to(device=flux.device, dtype=torch.bool)  # type: ignore[union-attr]
+            if is_real_t.ndim == 0:
+                is_real_t = is_real_t.expand(flux.shape[0])
+            s = torch.where(
+                is_real_t,
+                torch.full((), float(s_real), device=flux.device, dtype=flux.dtype),
+                torch.full((), float(s_fake), device=flux.device, dtype=flux.dtype),
+            ).view(-1, 1)
+            flux = torch.asinh(flux / s)
+
     channels: list[torch.Tensor] = [flux]
 
     if config.spectrum_use_wavelength:

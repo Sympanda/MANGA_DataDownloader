@@ -2,7 +2,7 @@
 
 Predict **6 Amara Pipe3D map channels** (Hα flux, Hβ flux, [OIII], [NII], Hα EW, stellar Av) on a fixed **76×76** MaNGA grid from SDSS imaging (+ optional 1D spectrum via FiLM).
 
-**Inputs:** 5-band SDSS `ugriz` cutouts (aligned 76×76 or native ~196×196), optional IFU footprint, optional 1D spectrum.  
+**Inputs:** 5-band SDSS `ugriz` cutouts (always WCS-aligned in the dataloader: 76×76 Amara grid or ~196 SDSS-native), optional IFU footprint, optional 1D spectrum.  
 **Outputs:** 6 scaled map channels at **76×76** (supervision always on the Pipe3D / Amara grid).
 
 ## Quick start
@@ -33,13 +33,14 @@ The model and dataloader support three spatial pipelines. Change only `config.js
 | `spatial_pipeline` | `imaging_resolution` | Description |
 |--------------------|----------------------|-------------|
 | `symmetric` | `aligned` | **Default.** 76×76 WCS-aligned SDSS + footprint channel → UNet/UNet++ → 76×76 maps |
-| `hr_encoder` | `native` | Native ~196×196 SDSS → HR encoder → project to 76×76 → footprint fusion → decoder |
-| `hr_full` | `native` | Full UNet/UNet++ on native SDSS → resize predictions to 76×76 |
+| `hr_encoder` | `native` | SDSS-native ~196×196 (Amara-oriented) → HR encoder → project to 76×76 → footprint fusion → decoder |
+| `hr_full` | `native` | Full UNet/UNet++ on SDSS-native imaging → resize predictions to 76×76 |
+| `hr_multiscale` | `native` | HR pyramid fused into every UNet encoder level |
 
 | `footprint_mode` | When to use |
 |------------------|-------------|
 | `spatial_channel` | With `symmetric` — footprint as a 6th input channel (current default) |
-| `fusion_concat` | With `hr_encoder` / `hr_full` — footprint fused on the 76×76 grid |
+| `fusion_concat` | With `hr_encoder` / `hr_full` / `hr_multiscale` — footprint fused on the 76×76 grid |
 | `loss_only` | Footprint not fed to the model; still used in masked losses |
 
 **Config presets** (set in both `data` and `model`, or just `model` — `runner.py` merges them):
@@ -50,17 +51,18 @@ The model and dataloader support three spatial pipelines. Change only `config.js
 "spatial_pipeline": "symmetric",
 "footprint_mode": "spatial_channel"
 
-// HR encoder experiment (recommended first native-SDSS try)
+// HR multi-scale (SDSS-native plate scale; still WCS-aligned in the dataloader)
 "imaging_resolution": "native",
-"spatial_pipeline": "hr_encoder",
+"spatial_pipeline": "hr_multiscale",
 "footprint_mode": "fusion_concat",
 "hr_project_mode": "bilinear"   // or "learned"
 ```
 
 **Notes:**
-- Ground-truth maps are only defined at **76×76** (~0.5″/pix on the Pipe3D grid). HR pipelines preserve SDSS detail in the encoder; loss is always on the MaNGA grid.
-- `imaging_resolution: "native"` disables geometric augmentation automatically (native cutouts are not on the MaNGA pixel grid).
-- Eval plots show whatever SDSS resolution the dataloader feeds (aligned or native).
+- Ground-truth maps are only defined at **76×76** (~0.5″/pix on the Pipe3D grid). HR pipelines preserve SDSS native detail in the encoder; loss is always on the MaNGA grid.
+- **WCS alignment always happens in the dataloader** before the model. `native` means SDSS plate scale @ ~196×196 (Amara-oriented), not an Amara×2 grid and not raw camera frames.
+- Imaging/spectrum soft-norm: `asinh(f/s_b)` from train-split percentiles (auto-computed on first train if missing). Pick `95` / `99` / `99.5` in `model.input_norm`.
+- Eval plots show whatever SDSS resolution the dataloader feeds (76 Amara-aligned or ~196 SDSS-native).
 
 ## Project layout
 

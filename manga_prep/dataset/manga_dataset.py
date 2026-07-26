@@ -16,11 +16,20 @@ from torch.utils.data import Dataset
 from manga_prep.targets.pipe3d_maps import AMARA_TARGET_KEYS, load_amara_training_targets
 from manga_prep.io.fits_io import open_fits
 from manga_prep.io.aligned_cache import (
+    ImagingGrid,
     aligned_legacy_path_from_row,
     aligned_sdss_path_from_row,
+    export_legacy_aligned,
+    export_sdss_aligned,
     load_aligned_imaging,
 )
-from manga_prep.io.imaging_alignment import _pipe3d_cube_path, reproject_cutout_to_amara_grid
+from manga_prep.io.imaging_alignment import (
+    SDSS_NATIVE_CANVAS,
+    _pipe3d_cube_path,
+    amara_aligned_pixel_shape,
+    reproject_cutout_stack_to_amara_grid,
+    reproject_cutout_stack_to_sdss_native_grid,
+)
 from manga_prep.dataset.index import (
     build_manga_dataset_index,
     legacy_imaging_ready,
@@ -34,8 +43,8 @@ SpectrumMode = Literal["real", "fake"] | None
 _SDSS_BANDS = ("u", "g", "r", "i", "z")
 _LEGACY_BANDS = ("g", "r", "i", "z")
 
-# Fixed canvas for native-resolution cutouts (SDSS ugriz are typically 196×196 or 128×128).
-NATIVE_IMAGING_CANVAS = 196
+# Fixed canvas for SDSS-native aligned HR imaging (and debug raw stacks).
+NATIVE_IMAGING_CANVAS = SDSS_NATIVE_CANVAS
 
 
 def _load_fits_image(path: Path) -> np.ndarray:
@@ -183,6 +192,9 @@ class MangaGalaxyDataset(Dataset):
         spectrum_wave_grid: np.ndarray | None = None,
         align_imaging_to_amara_grid: bool = True,
         prefer_aligned_cache: bool = True,
+        imaging_grid: ImagingGrid = "amara",
+        aligned_oversample: int = 1,
+        write_aligned_cache: bool = True,
         rebuild_index: bool = False,
     ) -> None:
         self.data_root = Path(data_root)
@@ -194,13 +206,29 @@ class MangaGalaxyDataset(Dataset):
         self.require_all = require_all
         self.target_scaled = target_scaled
         self.resample_spectrum = resample_spectrum
-        self.align_imaging_to_amara_grid = align_imaging_to_amara_grid
-        self.prefer_aligned_cache = prefer_aligned_cache
+        self.align_imaging_to_amara_grid = bool(align_imaging_to_amara_grid)
+        self.prefer_aligned_cache = bool(prefer_aligned_cache)
+        self.imaging_grid: ImagingGrid = imaging_grid  # type: ignore[assignment]
+        if self.imaging_grid not in ("amara", "sdss_native"):
+            raise ValueError(f"imaging_grid must be 'amara' or 'sdss_native', got {imaging_grid!r}")
+        self.aligned_oversample = int(aligned_oversample)
+        self.write_aligned_cache = bool(write_aligned_cache)
+        if self.imaging_grid == "sdss_native":
+            self.aligned_oversample = 1
+        if self.aligned_oversample < 1:
+            raise ValueError(f"aligned_oversample must be >= 1, got {aligned_oversample}")
         self.spectrum_wave_grid = (
             np.asarray(spectrum_wave_grid, dtype=np.float32)
             if spectrum_wave_grid is not None
             else default_spectrum_wave_grid()
         )
+
+        if not self.align_imaging_to_amara_grid:
+            raise ValueError(
+                "align_imaging_to_amara_grid=False is not supported for training. "
+                "All survey imaging must be WCS-reprojected in the dataloader "
+                "(Amara grid or SDSS-native Amara-oriented grid)."
+            )
 
         if not any((include_sdss_imaging, include_legacy_imaging, include_targets, spectrum is not None)):
             raise ValueError("Enable at least one input modality, targets, or spectrum.")
@@ -258,18 +286,41 @@ class MangaGalaxyDataset(Dataset):
 
         return (DEFAULT_TARGET_SIZE, DEFAULT_TARGET_SIZE)
 
+    def _imaging_pixel_shape(self, row: dict) -> tuple[int, int]:
+        """Expected imaging canvas for the configured grid."""
+        if self.imaging_grid == "sdss_native":
+            return (NATIVE_IMAGING_CANVAS, NATIVE_IMAGING_CANVAS)
+        return amara_aligned_pixel_shape(self._target_shape(row), oversample=self.aligned_oversample)
+
     def _load_aligned_cache(self, row: dict, *, survey: str) -> dict[str, object] | None:
-        if not (self.align_imaging_to_amara_grid and self.prefer_aligned_cache):
+        if not self.prefer_aligned_cache:
             return None
         if survey == "sdss":
-            cache_path = aligned_sdss_path_from_row(self.data_root, row)
+            cache_path = aligned_sdss_path_from_row(
+                self.data_root,
+                row,
+                grid=self.imaging_grid,
+                oversample=self.aligned_oversample,
+            )
         elif survey == "legacy":
-            cache_path = aligned_legacy_path_from_row(self.data_root, row)
+            cache_path = aligned_legacy_path_from_row(
+                self.data_root,
+                row,
+                grid=self.imaging_grid,
+                oversample=self.aligned_oversample,
+            )
         else:
             raise ValueError(f"Unknown survey: {survey!r}")
         if not cache_path.is_file() or cache_path.stat().st_size == 0:
             return None
-        return load_aligned_imaging(cache_path)
+        cached = load_aligned_imaging(cache_path)
+        data = np.asarray(cached["data"])
+        expected = self._imaging_pixel_shape(row)
+        if data.shape[-2:] != expected:
+            return None
+        cached["aligned_oversample"] = self.aligned_oversample
+        cached["grid"] = self.imaging_grid
+        return cached
 
     def _load_imaging_stack(
         self,
@@ -282,30 +333,53 @@ class MangaGalaxyDataset(Dataset):
         gal_dir = self._galaxy_dir(row)
         plate, ifu = row["plateifu"].split("-", 1)
         paths = [gal_dir / cutout_subdir / f"{file_prefix}-{plate}-{ifu}-{b}.fits" for b in bands]
-
-        if self.align_imaging_to_amara_grid:
-            pipe3d_path = _pipe3d_cube_path(gal_dir)
-            target_shape = self._target_shape(row)
-            stack = np.stack(
-                [
-                    reproject_cutout_to_amara_grid(
-                        path,
-                        pipe3d_path,
-                        target_shape=target_shape,
-                    )
-                    for path in paths
-                ],
-                axis=0,
+        pipe3d_path = _pipe3d_cube_path(gal_dir)
+        target_shape = self._target_shape(row)
+        if self.imaging_grid == "sdss_native":
+            stack, scale = reproject_cutout_stack_to_sdss_native_grid(
+                paths,
+                pipe3d_path,
+                shape_out=(NATIVE_IMAGING_CANVAS, NATIVE_IMAGING_CANVAS),
+                target_shape=target_shape,
             )
-        else:
-            stack = _stack_native_imaging_bands(paths)
-
-        return {"bands": bands, "data": stack, "aligned_to_amara_grid": self.align_imaging_to_amara_grid}
+            return {
+                "bands": bands,
+                "data": stack,
+                "aligned_to_amara_grid": True,
+                "aligned_oversample": 1,
+                "grid": "sdss_native",
+                "pixel_scale_arcsec": scale,
+            }
+        stack = reproject_cutout_stack_to_amara_grid(
+            paths,
+            pipe3d_path,
+            target_shape=target_shape,
+            oversample=self.aligned_oversample,
+        )
+        return {
+            "bands": bands,
+            "data": stack,
+            "aligned_to_amara_grid": True,
+            "aligned_oversample": self.aligned_oversample,
+            "grid": "amara",
+        }
 
     def _load_sdss_imaging(self, row: dict) -> dict[str, object]:
         cached = self._load_aligned_cache(row, survey="sdss")
         if cached is not None:
             return cached
+        if self.write_aligned_cache:
+            gal_dir = self._galaxy_dir(row)
+            export_sdss_aligned(
+                gal_dir,
+                skip_existing=False,
+                oversample=self.aligned_oversample,
+                grid=self.imaging_grid,
+                canvas=NATIVE_IMAGING_CANVAS,
+            )
+            cached = self._load_aligned_cache(row, survey="sdss")
+            if cached is not None:
+                return cached
         return self._load_imaging_stack(
             row,
             cutout_subdir="sdss_cutouts",
@@ -317,33 +391,30 @@ class MangaGalaxyDataset(Dataset):
         cached = self._load_aligned_cache(row, survey="legacy")
         if cached is not None:
             return cached
+        if self.write_aligned_cache:
+            gal_dir = self._galaxy_dir(row)
+            export_legacy_aligned(
+                gal_dir,
+                skip_existing=False,
+                oversample=self.aligned_oversample,
+                grid=self.imaging_grid,
+                canvas=NATIVE_IMAGING_CANVAS,
+            )
+            cached = self._load_aligned_cache(row, survey="legacy")
+            if cached is not None:
+                return cached
 
         gal_dir = self._galaxy_dir(row)
         plate, ifu = row["plateifu"].split("-", 1)
         for band_set in (_LEGACY_BANDS, ("g", "r", "z")):
             paths = [gal_dir / "legacy_cutouts" / f"legacy-{plate}-{ifu}-{b}.fits" for b in band_set]
             if all(path.is_file() for path in paths):
-                if self.align_imaging_to_amara_grid:
-                    pipe3d_path = _pipe3d_cube_path(gal_dir)
-                    target_shape = self._target_shape(row)
-                    stack = np.stack(
-                        [
-                            reproject_cutout_to_amara_grid(
-                                path,
-                                pipe3d_path,
-                                target_shape=target_shape,
-                            )
-                            for path in paths
-                        ],
-                        axis=0,
-                    )
-                else:
-                    stack = _stack_native_imaging_bands(paths)
-                return {
-                    "bands": band_set,
-                    "data": stack,
-                    "aligned_to_amara_grid": self.align_imaging_to_amara_grid,
-                }
+                return self._load_imaging_stack(
+                    row,
+                    cutout_subdir="legacy_cutouts",
+                    file_prefix="legacy",
+                    bands=band_set,
+                )
         raise FileNotFoundError(f"No consistent legacy imaging for {row['plateifu']}")
 
     def _load_spectrum(self, row: dict) -> dict[str, object]:

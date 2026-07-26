@@ -110,9 +110,6 @@ def _train_member(
     data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
     train_cfg = build_train_config(training_top, run_name=member_run)
 
-    if model_cfg.imaging_resolution == "native" and data_cfg.augmentation.enabled:
-        data_cfg.augmentation.enabled = False
-
     set_seed(member_seed)
     dl_train, dl_val, dl_test, dl_train_ns = make_manga_dataloaders(
         data_cfg,

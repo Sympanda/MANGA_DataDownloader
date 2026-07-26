@@ -52,6 +52,10 @@ def build_data_config(data_top: dict, *, imaging_resolution: str = "aligned") ->
     aug = data_top.get("augmentation", {}) or {}
     split = data_top.get("split", {}) or {}
     resolution = str(data_top.get("imaging_resolution", imaging_resolution))
+    oversample_raw = data_top.get("aligned_oversample", None)
+    aligned_oversample = None if oversample_raw is None else int(oversample_raw)
+    grid_raw = data_top.get("imaging_grid", None)
+    imaging_grid = None if grid_raw is None else str(grid_raw)
     return DataConfig(
         data_root=Path(data_top.get("data_root", "manga_sdss_fits")),
         index_path=Path(data_top["index_path"]) if data_top.get("index_path") else None,
@@ -63,6 +67,10 @@ def build_data_config(data_top: dict, *, imaging_resolution: str = "aligned") ->
         spectrum_fallback=bool(data_top.get("spectrum_fallback", True)),
         use_footprint_mask=bool(data_top.get("use_footprint_mask", True)),
         imaging_resolution=resolution,  # type: ignore[arg-type]
+        aligned_oversample=aligned_oversample,
+        imaging_grid=imaging_grid,  # type: ignore[arg-type]
+        align_imaging_to_amara_grid=True,
+        prefer_aligned_cache=bool(data_top.get("prefer_aligned_cache", True)),
         require_all=bool(data_top.get("require_all", True)),
         augmentation=AugmentConfig(
             enabled=bool(aug.get("enabled", True)),
@@ -87,20 +95,71 @@ def build_model_config(
     else:
         use_footprint_model = use_footprint
 
+    use_sdss = bool(data_top.get("use_sdss", True))
+    use_legacy = bool(data_top.get("use_legacy", False))
+    use_spectrum = bool(data_top.get("use_spectrum", True))
+
+    norm_top = model_top.get("input_norm", {}) or {}
+    input_norm_mode = str(norm_top.get("mode", "none"))
+    imaging_asinh_scales = None
+    spectrum_asinh_scale_fake = None
+    spectrum_asinh_scale_real = None
+    imaging_pct = float(norm_top.get("imaging_percentile", 99))
+    spectrum_pct = float(norm_top.get("spectrum_percentile", 99))
+    scales_path = norm_top.get("scales_path")
+    if input_norm_mode == "asinh":
+        from manga_prep.io.input_scales import (
+            ensure_input_asinh_scales,
+            normalize_percentile,
+            resolve_runtime_asinh_scales,
+        )
+
+        imaging_pct = normalize_percentile(norm_top.get("imaging_percentile", 99))
+        spectrum_pct = normalize_percentile(norm_top.get("spectrum_percentile", 99))
+        scales_path = ensure_input_asinh_scales(
+            data_top=data_top,
+            model_top=model_top,
+            imaging_resolution=imaging_resolution,
+        )
+        imaging_asinh_scales, spectrum_asinh_scale_fake, spectrum_asinh_scale_real = (
+            resolve_runtime_asinh_scales(
+                scales_path,
+                imaging_percentile=imaging_pct,
+                spectrum_percentile=spectrum_pct,
+                use_sdss=use_sdss,
+                use_legacy=use_legacy,
+            )
+        )
+
+    # After asinh, raw flux clamps are usually wrong — default them off unless set.
+    clamp_min = model_top.get("imaging_clamp_min", -5.0)
+    clamp_max = model_top.get("imaging_clamp_max", 100.0)
+    if input_norm_mode == "asinh" and "imaging_clamp_min" not in model_top:
+        clamp_min = None
+    if input_norm_mode == "asinh" and "imaging_clamp_max" not in model_top:
+        clamp_max = None
+
     return ModelConfig(
         architecture=model_top.get("architecture", "unet"),
         output_head=model_top.get("output_head", "single"),
-        use_sdss=bool(data_top.get("use_sdss", True)),
-        use_legacy=bool(data_top.get("use_legacy", False)),
-        use_spectrum=bool(data_top.get("use_spectrum", True)),
+        use_sdss=use_sdss,
+        use_legacy=use_legacy,
+        use_spectrum=use_spectrum,
         use_footprint_mask=use_footprint_model,
         imaging_resolution=imaging_resolution,  # type: ignore[arg-type]
         spatial_pipeline=model_top.get("spatial_pipeline", "symmetric"),
         footprint_mode=footprint_mode,
         target_spatial_size=int(model_top.get("target_spatial_size", 76)),
         hr_project_mode=model_top.get("hr_project_mode", "bilinear"),
-        imaging_clamp_min=model_top.get("imaging_clamp_min", -5.0),
-        imaging_clamp_max=model_top.get("imaging_clamp_max", 100.0),
+        imaging_clamp_min=clamp_min,
+        imaging_clamp_max=clamp_max,
+        input_norm_mode=input_norm_mode,  # type: ignore[arg-type]
+        input_norm_scales_path=str(scales_path) if scales_path else None,
+        input_norm_imaging_percentile=float(imaging_pct),
+        input_norm_spectrum_percentile=float(spectrum_pct),
+        imaging_asinh_scales=imaging_asinh_scales,
+        spectrum_asinh_scale_fake=spectrum_asinh_scale_fake,
+        spectrum_asinh_scale_real=spectrum_asinh_scale_real,
         base_channels=int(model_top.get("base_channels", 64)),
         bottleneck_multiplier=int(model_top.get("bottleneck_multiplier", 16)),
         n_down=int(model_top.get("n_down", 4)),
@@ -134,7 +193,12 @@ def build_model_config(
 def _describe_inputs(model_cfg: ModelConfig, data_cfg: DataConfig) -> str:
     parts: list[str] = []
     if model_cfg.use_sdss:
-        res = "76×76" if model_cfg.imaging_resolution == "aligned" else "native"
+        grid = data_cfg.resolve_imaging_grid()
+        if grid == "sdss_native":
+            res = "SDSS-native ~196×196 (Amara-oriented)"
+        else:
+            ov = data_cfg.resolve_aligned_oversample()
+            res = f"Amara-aligned ×{ov}"
         parts.append(f"{model_cfg.n_sdss_bands} SDSS ({res})")
     if model_cfg.use_legacy:
         parts.append(f"{model_cfg.n_legacy_bands} Legacy")
@@ -295,14 +359,6 @@ def main(argv: list[str] | None = None) -> int:
     model_cfg = build_model_config(model_top, data_top, imaging_resolution=imaging_resolution)
     data_cfg = build_data_config(data_top, imaging_resolution=imaging_resolution)
 
-    if model_cfg.imaging_resolution == "native" and data_cfg.augmentation.enabled:
-        print(
-            "  note: disabling geometric augmentation for native-resolution SDSS "
-            "(native cutouts are not on the MaNGA pixel grid).",
-            flush=True,
-        )
-        data_cfg.augmentation.enabled = False
-
     save_root = Path(training_top.get("logging", {}).get("root_dir", "runs/manga_maps"))
     run_name = _resolve_run_name(save_root, args.run_name, args.autoinc)
     train_cfg = build_train_config(training_top, run_name=run_name)
@@ -335,19 +391,28 @@ def main(argv: list[str] | None = None) -> int:
         f"  conditioning : film={model_cfg.film_injection}  "
         f"deep_supervision={model_cfg.deep_supervision}"
     )
-    print(f"  spatial pipe : {model_cfg.spatial_pipeline}  imaging={model_cfg.imaging_resolution}")
+    print(f"  spatial pipe : {model_cfg.spatial_pipeline}  imaging={model_cfg.imaging_resolution} (grid={data_cfg.resolve_imaging_grid()})")
     print(f"  footprint    : {model_cfg.footprint_mode}")
     print(f"  inputs       : {_describe_inputs(model_cfg, data_cfg)}")
     print(f"  losses       : {list(zip(model_cfg.losses, model_cfg.loss_weights))}")
     print(f"  split csv    : {data_cfg.split_csv_path}")
     if data_cfg.use_sdss:
-        counts = count_aligned_caches(base_dataset.data_root, base_dataset.rows)
+        grid = data_cfg.resolve_imaging_grid()
+        oversample = data_cfg.resolve_aligned_oversample()
+        counts = count_aligned_caches(
+            base_dataset.data_root,
+            base_dataset.rows,
+            oversample=oversample,
+            grid=grid,
+        )
         cached, eligible = counts["sdss_cached"], counts["sdss_eligible"]
-        print(f"  SDSS aligned cache: {cached:,}/{eligible:,} galaxies")
+        print(f"  SDSS aligned cache ({grid}): {cached:,}/{eligible:,} galaxies")
         if cached < eligible:
             print(
-                "  tip: pre-export aligned imaging for faster epochs:\n"
-                "       python -m manga_prep export-aligned-imaging --survey sdss --use-index --skip-existing --workers 8"
+                "  WARNING: missing aligned caches → each sample WCS-reprojects (very slow).\n"
+                "  Pre-export once, then restart training:\n"
+                f"       python -m manga_prep export-aligned-imaging --config {args.config} "
+                f"--survey sdss --skip-existing --workers 8"
             )
     print("=" * 60)
 

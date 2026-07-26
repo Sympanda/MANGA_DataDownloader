@@ -49,24 +49,70 @@ Spectra are resampled to a fixed wavelength grid (`3622–10354 Å`, 4563 bins) 
 
 ## Input imaging orientation
 
-Survey cutout FITS files are **reprojected onto the Pipe3D / Amara spaxel WCS**
-(same 76×76 canvas as map targets). This matches the workflow in
-`sdss_legacy_fits_jpeg_comparison.ipynb` — SDSS frame cutouts in particular are
-not north-up in native orientation and must not be used raw.
+Survey cutout FITS files are **always WCS-reprojected onto the Pipe3D / Amara
+spaxel grid in the dataloader** before the model sees them. This matches the
+workflow in `sdss_legacy_fits_jpeg_comparison.ipynb` — SDSS frame cutouts in
+particular are not north-up in native orientation and must not be used raw.
 
-Set `align_imaging_to_amara_grid=False` only for debugging raw cutouts.
+| Mode | Config | Imaging tensor |
+|------|--------|----------------|
+| `aligned` | `imaging_resolution: "aligned"` | Amara FoV / orientation, **76×76** |
+| `native` | `imaging_resolution: "native"` | **SDSS plate scale**, fixed **196×196**, Amara-oriented (larger FoV than maps) |
+
+Optional Amara-grid override: `data.aligned_oversample` (integer ≥ 1) only applies when
+using the Amara grid (`aligned`). Pre-exported caches:
+`aligned_imaging/sdss_aligned.npz` (76) or `sdss_aligned_native.npz` (196).
+
+`align_imaging_to_amara_grid=False` raises in `MangaGalaxyDataset` (training path).
+Raw cutout stacking (`_stack_native_imaging_bands`) remains only as a debug helper.
 
 Requires `reproject` (`pip install reproject`).
 
-**Training uses raw aligned flux** — not the percentile scaling in the preview notebook
-(that scaling is display-only).
+**Training uses asinh-softened flux when `model.input_norm.mode="asinh"`** (see below).
+Display notebooks may still use percentile stretch for visualization only.
+
+## Input asinh scales
+
+Per-band / per-spectrum soft scales ``s_b`` are estimated on the **train** split only:
+
+```bash
+python -m manga_prep compute-input-scales --config config.jsonc
+# → manga_sdss_fits/stats/input_asinh_scales.json
+```
+
+The JSON stores percentiles **95 / 99 / 99.5** for:
+
+- SDSS `u,g,r,i,z` (footprint-masked |flux|)
+- optional Legacy bands
+- fake aperture spectra
+- real SDSS fiber spectra
+
+Config picks which percentile to apply at train/eval time:
+
+```jsonc
+"input_norm": {
+  "mode": "asinh",
+  "scales_path": "manga_sdss_fits/stats/input_asinh_scales.json",
+  "auto_compute": true,          // if file missing, runner builds it on train split
+  "imaging_percentile": 99,      // 95 | 99 | 99.5 (alias 995)
+  "spectrum_percentile": 99
+}
+```
+
+If `scales_path` is absent when training starts and `auto_compute` is true (default),
+`runner.py` / `build_model_config` calls the same computation as
+`python -m manga_prep compute-input-scales`. Set `auto_compute: false` to fail fast
+instead.
+
+Runtime applies ``asinh(f / s_b)`` in `prepare_imaging_input` / `prepare_spectrum_input`
+(before the model). Spectrum λ_norm and log1p(ivar) are unchanged.
 
 ## Conditional UNet
 
 See `manga_models/` and `runner.py` (or `scripts/legacy/train_conditional_unet.py`).
 
 v1 conditioning:
-- **SDSS / Legacy**: channel-concat at UNet input (both aligned to Amara grid when `align_imaging_to_amara_grid=True`)
+- **SDSS / Legacy**: channel-concat at UNet input (always Amara-WCS-aligned in the loader)
 - **Footprint mask**: optional extra input channel
 - **Spectrum**: 1D CNN → **FiLM** (`bottleneck` on deepest encoder, or multi-level `encoder`)
 - **UNet++ deep supervision** (optional): 1×1 heads on nested full-res nodes; aux masked L1 + full loss on deepest
@@ -177,7 +223,10 @@ Raw values are always in `{feature}_raw` inside `amara_maps.npz`.
 
 - Fixed **76×76** output grid — no variable-size batches for maps.
 - No explicit IFU size conditioning needed; `footprint_mask` and `target_loss_masks` encode geometry.
-- Imaging normalization: raw cutouts are fine for a first pass; optional arcsinh per band can be added later.
+- Imaging / spectrum soft-norm: `asinh(f / s_b)` via `model.input_norm` (train-split
+  percentiles in `manga_sdss_fits/stats/input_asinh_scales.json`). Compute with
+  `python -m manga_prep compute-input-scales --config config.jsonc`, then pick
+  `imaging_percentile` / `spectrum_percentile` ∈ {95, 99, 99.5}.
 - Preview samples: see `manga_dataloader_preview.ipynb`.
 
 ## Tests

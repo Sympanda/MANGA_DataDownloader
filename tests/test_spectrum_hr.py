@@ -13,7 +13,7 @@ from src.models.wrapper import MapGenerator, prepare_spectrum_input
 
 def _batch(cfg: ModelConfig, *, img_size: int | None = None, batch_size: int = 2) -> dict:
     t = cfg.target_spatial_size
-    img = img_size if img_size is not None else (76 if cfg.imaging_resolution == "aligned" else 128)
+    img = img_size if img_size is not None else (76 if cfg.imaging_resolution == "aligned" else 196)
     return {
         "footprint_mask": torch.ones(batch_size, t, t),
         "inputs": {

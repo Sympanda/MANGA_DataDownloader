@@ -229,25 +229,32 @@ class Trainer:
         for epoch in range(1, self.cfg.epochs + 1):
             cur_lr = self._set_lr(epoch)
             train_logs = []
+            n_train = len(dl_train)
             pbar = tqdm(
                 dl_train,
                 desc=f"Epoch {epoch}/{self.cfg.epochs} [train]",
-                leave=False,
-                mininterval=1.0,
+                leave=n_train <= 4,  # keep bar visible on tiny overfit loaders
+                mininterval=0.1 if n_train <= 4 else 1.0,
+                dynamic_ncols=True,
             )
             for batch in pbar:
                 stats = self._step(batch, train=True, epoch=epoch)
                 pbar.set_postfix({"loss": f"{stats.get('loss', 0):.4f}"})
                 train_logs.append(stats)
 
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
             val_logs = []
             self.model.eval()
             with torch.no_grad():
+                n_val = len(dl_val)
                 pbar = tqdm(
                     dl_val,
                     desc=f"Epoch {epoch}/{self.cfg.epochs} [val]",
-                    leave=False,
-                    mininterval=1.0,
+                    leave=n_val <= 4,
+                    mininterval=0.1 if n_val <= 4 else 1.0,
+                    dynamic_ncols=True,
                 )
                 for batch in pbar:
                     stats = self._step(batch, train=False, epoch=epoch)

@@ -56,7 +56,10 @@ def _resolve_use_hr_cross_attn(model_top: dict) -> bool:
 
 
 def _resolve_hr_cross_attn_levels(model_top: dict) -> tuple[int, ...]:
-    raw = model_top.get("hr_cross_attn_levels", model_top.get("hr_cross_attention_levels", (0, 1)))
+    raw = model_top.get(
+        "hr_cross_attn_levels",
+        model_top.get("hr_cross_attention_levels", (1,)),
+    )
     return tuple(int(i) for i in raw)
 
 
@@ -197,6 +200,8 @@ def build_model_config(
         hr_encoder_n_down=int(model_top.get("hr_encoder_n_down", 3)),
         hr_attn_heads=int(model_top.get("hr_attn_heads", 4)),
         hr_attn_dropout=float(model_top.get("hr_attn_dropout", 0.0)),
+        hr_attention_mode=str(model_top.get("hr_attention_mode", "local")),  # type: ignore[arg-type]
+        hr_attention_window=int(model_top.get("hr_attention_window", 7)),
         imaging_clamp_min=clamp_min,
         imaging_clamp_max=clamp_max,
         input_norm_mode=input_norm_mode,  # type: ignore[arg-type]
@@ -445,6 +450,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  HR cross-attn: survey={model_cfg.hr_survey}  "
             f"levels={list(model_cfg.hr_cross_attn_levels)}  "
+            f"mode={model_cfg.hr_attention_mode}  "
+            f"window={model_cfg.hr_attention_window}  "
             f"encoder_n_down={model_cfg.hr_encoder_n_down}"
         )
     print(f"  footprint    : {model_cfg.footprint_mode}")

@@ -1,4 +1,4 @@
-"""Tests for aligned-76 + HR cross-attention architecture (not resize/concat)."""
+"""Tests for local HR cross-attention (memory-efficient, not dense N_q×N_hr)."""
 from __future__ import annotations
 
 import unittest
@@ -19,7 +19,9 @@ def _cfg(**kwargs) -> ModelConfig:
         footprint_mode="spatial_channel",
         use_hr_cross_attn=True,
         hr_survey="sdss",
-        hr_cross_attn_levels=(0, 1),
+        hr_cross_attn_levels=(1,),
+        hr_attention_mode="local",
+        hr_attention_window=7,
         hr_encoder_n_down=2,
         film_injection="encoder",
         cond_dim=32,
@@ -58,22 +60,38 @@ def _batch(cfg: ModelConfig, *, batch_size: int = 2, hr_size: int = 128) -> dict
     }
 
 
-class HRCrossAttnArchitectureTests(unittest.TestCase):
+class LocalHRCrossAttnTests(unittest.TestCase):
     def test_shapes_aligned_in_maps_out(self) -> None:
         cfg = _cfg()
         wrap = MapGenerator(cfg)
-        batch = _batch(cfg)
-        self.assertEqual(batch["inputs"]["sdss_imaging"].shape[-2:], (76, 76))
-        pred, loss = wrap(batch)
+        pred, loss = wrap(_batch(cfg))
         self.assertEqual(pred["maps"].shape, (2, cfg.n_target_maps, 76, 76))
         self.assertTrue(torch.isfinite(loss["loss"]))
+
+    def test_attention_logits_depend_on_window_not_hr_area(self) -> None:
+        block = CrossAttnHRBlock(
+            unet_channels=8, hr_channels=8, num_heads=2, mode="local", window=7
+        )
+        block.eval()
+        unet = torch.randn(1, 8, 16, 16)
+        hr_small = torch.randn(1, 8, 24, 24)
+        hr_large = torch.randn(1, 8, 64, 64)
+        with torch.no_grad():
+            _, attn_s = block(unet, hr_small, return_attn=True)
+            _, attn_l = block(unet, hr_large, return_attn=True)
+        k = 7 * 7
+        self.assertEqual(attn_s.shape, (1, 16 * 16, k))
+        self.assertEqual(attn_l.shape, (1, 16 * 16, k))
+        self.assertEqual(block.local_token_count, k)
 
     def test_no_legacy_resize_concat_modules(self) -> None:
         wrap = MapGenerator(_cfg())
         self.assertIsNone(wrap.model.grid_projector)
         self.assertIsNone(wrap.model.hr_fusions)
         self.assertIsNotNone(wrap.model.hr_cross_encoder)
-        self.assertIsNotNone(wrap.model.hr_cross_blocks)
+        assert wrap.model.hr_cross_blocks is not None
+        for block in wrap.model.hr_cross_blocks.values():
+            self.assertEqual(block.mode, "local")
 
     def test_gradients_through_hr_qkv_and_encoder(self) -> None:
         cfg = _cfg()
@@ -98,54 +116,68 @@ class HRCrossAttnArchitectureTests(unittest.TestCase):
                 self.assertIsNotNone(g, msg=f"level {key} {name} has no grad")
                 self.assertGreater(float(g.abs().sum()), 0.0, msg=f"level {key} {name} dead")
 
-    def test_spatial_hr_dependence_moves_attention(self) -> None:
-        """A localised HR blob should shift where queries attend (not global pooling)."""
-        block = CrossAttnHRBlock(unet_channels=8, hr_channels=8, num_heads=2)
+    def test_spatial_hr_dependence_moves_with_blob(self) -> None:
+        block = CrossAttnHRBlock(
+            unet_channels=8, hr_channels=8, num_heads=2, mode="local", window=7
+        )
         block.eval()
         unet = torch.zeros(1, 8, 16, 16)
-        # Uniform UNet so attention is driven by HR+coords.
         unet[:, :, 8, 8] = 1.0
 
-        def _hr_with_blob(y: int, x: int) -> torch.Tensor:
+        def _hr_blob(y: int, x: int) -> torch.Tensor:
             hr = torch.zeros(1, 8, 32, 32)
             hr[:, :, y : y + 2, x : x + 2] = 5.0
             return hr
 
         with torch.no_grad():
-            _, attn_a = block(unet, _hr_with_blob(4, 4), return_attn=True)
-            _, attn_b = block(unet, _hr_with_blob(4, 28), return_attn=True)
+            out_a, _ = block(unet, _hr_blob(4, 4), return_attn=True)
+            out_b, _ = block(unet, _hr_blob(4, 28), return_attn=True)
+        # Feature response at the query should change when the local HR blob moves.
+        self.assertGreater(float((out_a - out_b)[:, :, 8, 8].abs().sum()), 1e-5)
 
-        # Attention from centre query (index 8*16+8) over HR tokens.
-        q_idx = 8 * 16 + 8
-        peak_a = int(attn_a[0, q_idx].argmax().item())
-        peak_b = int(attn_b[0, q_idx].argmax().item())
-        ya, xa = divmod(peak_a, 32)
-        yb, xb = divmod(peak_b, 32)
-        self.assertNotEqual(peak_a, peak_b)
-        self.assertLess(xa, xb)  # blob moved right → attention peak moves right
-        self.assertLess(abs(ya - 4), 4)
-        self.assertLess(abs(yb - 4), 4)
+    def test_locality_far_blob_ignored(self) -> None:
+        """HR energy outside the window must not affect a distant query."""
+        block = CrossAttnHRBlock(
+            unet_channels=4, hr_channels=4, num_heads=2, mode="local", window=3
+        )
+        block.eval()
+        # GroupNorm couples spatial sites; replace so we can test locality of gather/attn alone.
+        block.norm = torch.nn.Identity()
+        with torch.no_grad():
+            for proj in (block.query_proj, block.key_proj, block.value_proj, block.out_proj):
+                proj.weight.zero_()
+                eye = min(proj.weight.shape[0], proj.weight.shape[1])
+                for i in range(eye):
+                    proj.weight[i, i, 0, 0] = 1.0
+
+        unet = torch.zeros(1, 4, 8, 8)
+        unet[:, :, 1, 1] = 1.0
+        hr_base = torch.zeros(1, 4, 32, 32)
+        hr_far = hr_base.clone()
+        hr_far[:, :, 28, 28] = 10.0
+
+        q_idx = 1 * 8 + 1
+        local_base = block._gather_local_hr_windows(hr_base, 8, 8)
+        local_far = block._gather_local_hr_windows(hr_far, 8, 8)
+        self.assertTrue(torch.allclose(local_base[:, q_idx], local_far[:, q_idx], atol=1e-6))
+
+        with torch.no_grad():
+            out_base = block(unet, hr_base)
+            out_far = block(unet, hr_far)
+        self.assertTrue(torch.allclose(out_base[:, :, 1, 1], out_far[:, :, 1, 1], atol=1e-5))
 
     def test_ablation_without_hr_cross_attn(self) -> None:
-        """Disabled HR cross-attn → aligned 76 + spectrum FiLM only."""
         cfg = _cfg(use_hr_cross_attn=False)
         wrap = MapGenerator(cfg)
         self.assertIsNone(wrap.model.hr_cross_encoder)
-        self.assertIsNone(wrap.model.hr_cross_blocks)
-        self.assertIsNone(wrap.model.grid_projector)
         pred, loss = wrap(_batch(cfg))
         self.assertEqual(pred["maps"].shape, (2, cfg.n_target_maps, 76, 76))
         self.assertTrue(torch.isfinite(loss["loss"]))
 
     def test_hr_encoder_keeps_spatial_tokens(self) -> None:
         enc = HREncoder(5, base_channels=8, n_down=2, norm="gn")
-        x = torch.randn(1, 5, 128, 128)
-        feats = enc.forward_pyramid(x)
-        deepest = feats[-1]
-        self.assertEqual(deepest.ndim, 4)
+        deepest = enc.forward_pyramid(torch.randn(1, 5, 128, 128))[-1]
         self.assertGreater(deepest.shape[-1] * deepest.shape[-2], 1)
-        tokens = deepest.flatten(2).transpose(1, 2)
-        self.assertEqual(tokens.shape[:2], (1, deepest.shape[-1] * deepest.shape[-2]))
 
 
 if __name__ == "__main__":

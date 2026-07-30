@@ -42,7 +42,9 @@ def main() -> int:
             footprint_mode="spatial_channel",
             use_hr_cross_attn=True,
             hr_survey="sdss",
-            hr_cross_attn_levels=(0, 1),
+            hr_cross_attn_levels=(1,),
+            hr_attention_mode="local",
+            hr_attention_window=7,
             hr_encoder_n_down=2,
         ),
     ]

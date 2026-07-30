@@ -23,8 +23,9 @@
     },
 
     "batching": {
-      "train_batch_size": 32,
-      "eval_batch_size": 64,
+      // Level-0 local HR xattn is VRAM-heavy; keep eval ≤ train.
+      "train_batch_size": 16,
+      "eval_batch_size": 16,
       "num_workers": 4
     },
 
@@ -97,13 +98,16 @@
     "target_spatial_size": 76,
     "hr_project_mode": "bilinear",
 
-    // High-res morphology via cross-attention (ablation: set false).
-    // Accepts aliases: use_hr_cross_attention / hr_cross_attention_levels.
-    // HR survey: "sdss" (~196 native) or "legacy" (DECaLS/Legacy at native grid).
+    // High-res morphology via local cross-attention (ablation: set false).
+    // Accepts aliases: use_hr_cross_attn / hr_cross_attn_levels.
+    // Levels 0+1 (76×76 and 38×38) with local 7×7 windows (proj-before-gather).
     "use_hr_cross_attention": true,
     "hr_survey": "sdss",
     "hr_cross_attention_levels": [0, 1],
-    "hr_encoder_n_down": 3,
+    "hr_attention_mode": "local",
+    "hr_attention_window": 7,
+    // Shallower HR encoder keeps high-frequency morphology (1 down ≈ stem + 98px).
+    "hr_encoder_n_down": 1,
     "hr_attn_heads": 4,
     "hr_attn_dropout": 0.0,
 
@@ -126,7 +130,7 @@
     "base_channels": 64,
     "bottleneck_multiplier": 16,
     "n_down": 4,
-    "dropout": 0.05,
+    "dropout": 0.0,
     "upsample_mode": "transpose",
     "norm": "gn",
     "residual_blocks": true,

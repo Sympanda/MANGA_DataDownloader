@@ -53,7 +53,9 @@ The model and dataloader support three spatial pipelines. Change only `config.js
 "footprint_mode": "spatial_channel",
 "use_hr_cross_attention": true,
 "hr_survey": "sdss",
-"hr_cross_attention_levels": [0, 1]
+"hr_cross_attention_levels": [1],
+"hr_attention_mode": "local",
+"hr_attention_window": 7
 
 // Ablation without HR
 "use_hr_cross_attention": false
@@ -135,6 +137,7 @@ Pre-v2 training scripts live in `scripts/legacy/` if you still need them.
 - **Config reference:** [`config.jsonc`](config.jsonc)
 - **Mask-safe losses:** [`docs/masked_losses.md`](docs/masked_losses.md)
 - **Ablations / config toggles (B–E):** [`docs/model_ablations.md`](docs/model_ablations.md)
+- **Architecture grid sweep (RMSE/MAE/R² comparison):** `python runner_arch_ablation.py --dry-run`
 
 ## Tests
 

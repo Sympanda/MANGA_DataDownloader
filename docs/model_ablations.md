@@ -80,13 +80,24 @@ Keep the **76×76 aligned** backbone. Load SDSS-native (~196) as a side stream, 
 "use_hr_cross_attn": true,
 "hr_survey": "sdss",
 "hr_cross_attn_levels": [0, 1],
-"hr_encoder_n_down": 3,
+"hr_encoder_n_down": 1,
+"hr_attention_mode": "local",
+"hr_attention_window": 7,
 "spectrum_pooling": "avg",
 "spectrum_use_wavelength": false,
 "spectrum_use_ivar": false
 ```
 
 Pre-export both Amara and SDSS-native caches. Ablate with `"use_hr_cross_attn": false`.
+
+Sense-checks:
+```powershell
+# Does HR change predictions? (Δ ~ 0 ⇒ ignored)
+python scripts/hr_zero_contribution.py --run-name model_d_hr_xattn --split val
+
+# Can the model overfit ~32 galaxies? (capacity / label check; HR forced off)
+python scripts/overfit_tiny.py --config config.jsonc --n-galaxies 32 --run-name overfit_32 --autoinc
+```
 
 ```powershell
 python runner.py --config config.jsonc --run-name model_d_hr_xattn --autoinc
@@ -103,6 +114,9 @@ python runner.py --config config.jsonc --run-name model_d_hr_xattn --autoinc
 "use_hr_cross_attn": true,
 "hr_survey": "sdss",
 "hr_cross_attn_levels": [0, 1],
+"hr_encoder_n_down": 1,
+"hr_attention_mode": "local",
+"hr_attention_window": 7,
 "spectrum_pooling": "attention",
 "spectrum_use_wavelength": true,
 "spectrum_use_ivar": true,
@@ -110,7 +124,7 @@ python runner.py --config config.jsonc --run-name model_d_hr_xattn --autoinc
 "film_injection": "encoder"
 ```
 
-Current `config.jsonc` default.
+Current `config.jsonc` default (shallow HR + local attn on levels 0 and 1).
 
 ---
 
@@ -140,7 +154,40 @@ FiLM API is unchanged: encoder still emits `(B, cond_dim)`.
 
 ---
 
-## Loss balancing (always on)
+## Automated architecture grid (no Optuna)
+
+Fixed factorial over the big knobs (UNet vs UNet++, deep supervision, spectrum,
+HR cross-attn). Trains each cell, runs `paper_eval` (RMSE / MAE / R² / …), and
+writes comparison plots under `runs/arch_ablation/<sweep>/analysis/`.
+
+```powershell
+# Preview cells
+python runner_arch_ablation.py --dry-run --grid core
+
+# Full core grid (~8 runs)
+python runner_arch_ablation.py --sweep-name arch_v1 --grid core --device cuda:1
+
+# Resume / subset
+python runner_arch_ablation.py --sweep-name arch_v1 --only C_unetpp_ds,D_unetpp_ds_spec --skip-existing
+
+# Re-plot only
+python runner_arch_ablation.py --sweep-name arch_v1 --analyze-only
+```
+
+| Cell | Meaning |
+|------|---------|
+| `A_unet` | Plain UNet, imaging only |
+| `B_unetpp` | UNet++ without DS |
+| `C_unetpp_ds` | UNet++ + DS (baseline for deltas) |
+| `D_unetpp_ds_spec` | + spectrum package (Model C) |
+| `E_unetpp_ds_hr` | + HR cross-attn (Model D) |
+| `F_unetpp_ds_spec_hr` | spectrum + HR (Model E) |
+| `G_unet_spec` | UNet + spectrum |
+| `H_unetpp_spec_nods` | UNet++ + spectrum, no DS |
+
+`--grid extended` adds FiLM-off and UNet+spectrum+HR controls.
+
+---
 
 Pixel / grad / Laplacian losses average **per galaxy × map**, then over active maps.
 No config flag — this is the corrected default.

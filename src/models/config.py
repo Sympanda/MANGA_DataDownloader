@@ -16,6 +16,7 @@ HRProjectMode = Literal["bilinear", "learned"]
 SpectrumPooling = Literal["avg", "attention"]
 InputNormMode = Literal["none", "asinh"]
 HRSurvey = Literal["sdss", "legacy"]
+HRAttentionMode = Literal["local", "global"]
 
 
 @dataclass
@@ -43,10 +44,13 @@ class ModelConfig:
     # High-res morphology via cross-attention (side stream; backbone stays 76×76 aligned).
     use_hr_cross_attn: bool = False
     hr_survey: HRSurvey = "sdss"  # "sdss" → native ~196; "legacy" → Legacy HR
-    hr_cross_attn_levels: tuple[int, ...] = (0, 1)  # UNet spine indices (76, 38)
+    # Default: level 1 (38×38) only — dense attn at 76×76 OOMs; local window is cheap.
+    hr_cross_attn_levels: tuple[int, ...] = (1,)
     hr_encoder_n_down: int = 3  # 196 → ~24 token grid at deepest level
     hr_attn_heads: int = 4
     hr_attn_dropout: float = 0.0
+    hr_attention_mode: HRAttentionMode = "local"
+    hr_attention_window: int = 7  # odd; K = window² local HR tokens per query
 
     imaging_clamp_min: float | None = -5.0
     imaging_clamp_max: float | None = 100.0
@@ -178,6 +182,16 @@ class ModelConfig:
                 )
             if self.hr_encoder_n_down < 1:
                 raise ValueError("hr_encoder_n_down must be >= 1")
+            if self.hr_attention_mode not in ("local", "global"):
+                raise ValueError(
+                    f"hr_attention_mode must be 'local' or 'global', got {self.hr_attention_mode!r}"
+                )
+            if self.hr_attention_mode == "local":
+                w = int(self.hr_attention_window)
+                if w < 1 or w % 2 == 0:
+                    raise ValueError(
+                        f"hr_attention_window must be a positive odd integer, got {w}"
+                    )
         if self.spatial_pipeline == "hr_multiscale" and self.imaging_resolution != "native":
             raise ValueError(
                 "spatial_pipeline='hr_multiscale' requires imaging_resolution='native' "

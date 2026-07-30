@@ -143,7 +143,7 @@ class HRMultiscaleTests(unittest.TestCase):
 
 class HRCrossAttnTests(unittest.TestCase):
     def test_cross_attn_block_shape(self) -> None:
-        block = CrossAttnHRBlock(unet_channels=16, hr_channels=32, num_heads=4)
+        block = CrossAttnHRBlock(unet_channels=16, hr_channels=32, num_heads=4, mode="local", window=5)
         unet = torch.randn(2, 16, 38, 38)
         hr = torch.randn(2, 32, 24, 24)
         out = block(unet, hr)
@@ -159,7 +159,9 @@ class HRCrossAttnTests(unittest.TestCase):
             footprint_mode="spatial_channel",
             use_hr_cross_attn=True,
             hr_survey="sdss",
-            hr_cross_attn_levels=(0, 1),
+            hr_cross_attn_levels=(1,),
+            hr_attention_mode="local",
+            hr_attention_window=7,
             hr_encoder_n_down=2,
             film_injection="encoder",
             cond_dim=32,
@@ -193,7 +195,9 @@ class HRCrossAttnTests(unittest.TestCase):
             footprint_mode="loss_only",
             use_footprint_mask=False,
             use_hr_cross_attn=True,
-            hr_cross_attn_levels=(0,),
+            hr_cross_attn_levels=(1,),
+            hr_attention_mode="local",
+            hr_attention_window=5,
             hr_encoder_n_down=2,
             film_injection="none",
             use_spectrum=False,
@@ -209,7 +213,7 @@ class HRCrossAttnTests(unittest.TestCase):
         with torch.no_grad():
             base, _ = wrap(batch)
             assert wrap.model.hr_cross_blocks is not None
-            wrap.model.hr_cross_blocks["0"].out_proj.weight.zero_()
+            wrap.model.hr_cross_blocks["1"].out_proj.weight.zero_()
             pert, _ = wrap(batch)
         self.assertGreater(float((pert["maps"] - base["maps"]).abs().sum()), 1e-5)
 

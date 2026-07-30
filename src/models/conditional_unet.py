@@ -83,13 +83,12 @@ class ConditionalMapModel(nn.Module):
             )
             unet_channels = self._encoder_level_channels_preview(config)
             levels = tuple(int(i) for i in config.hr_cross_attn_levels)
-            max_level = max(levels)
             n_hr = len(self.hr_cross_encoder.level_channels)
             blocks: dict[str, CrossAttnHRBlock] = {}
             for level in levels:
-                # Deeper UNet levels attend to deeper (more compressed) HR tokens.
-                hr_idx = n_hr - 1 - (max_level - int(level))
-                hr_idx = max(0, min(hr_idx, n_hr - 1))
+                # Prefer shallower HR morphology when available.
+                # With hr_encoder_n_down=1 and levels (0,1): level0→stem, level1→1×down.
+                hr_idx = min(int(level), n_hr - 1)
                 hr_ch = self.hr_cross_encoder.level_channels[hr_idx]
                 key = str(int(level))
                 blocks[key] = CrossAttnHRBlock(
@@ -97,6 +96,8 @@ class ConditionalMapModel(nn.Module):
                     hr_ch,
                     num_heads=config.hr_attn_heads,
                     dropout=config.hr_attn_dropout,
+                    mode=config.hr_attention_mode,
+                    window=config.hr_attention_window,
                 )
                 self._hr_cross_pyramid_idx[key] = hr_idx
             self.hr_cross_blocks = nn.ModuleDict(blocks)
@@ -432,9 +433,12 @@ class ConditionalMapModel(nn.Module):
             if x_hr is None:
                 raise ValueError("use_hr_cross_attn=true requires x_hr in forward()")
             assert self.hr_cross_encoder is not None
-            # Keep full spatial pyramid — never globally pool HR before attention.
-            self._hr_cross_pyramid = self.hr_cross_encoder.forward_pyramid(x_hr)
-            # Sanity: cross-attn mode must not use legacy resize/concat modules.
+            pyramid = self.hr_cross_encoder.forward_pyramid(x_hr)
+            # Keep only levels used by cross-attn (still backprops through encoder).
+            needed = sorted(set(self._hr_cross_pyramid_idx.values()))
+            self._hr_cross_pyramid = [
+                pyramid[i] if i in needed else None for i in range(len(pyramid))
+            ]
             if self.hr_fusions is not None or self.grid_projector is not None:
                 raise RuntimeError(
                     "Internal error: HR cross-attention mode must not use "

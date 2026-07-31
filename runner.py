@@ -182,6 +182,17 @@ def build_model_config(
     if input_norm_mode == "asinh" and "imaging_clamp_max" not in model_top:
         clamp_max = None
 
+    from manga_prep.targets.pipe3d_maps import AMARA_TARGET_KEYS
+
+    raw_keys = model_top.get("target_keys")
+    if raw_keys is None:
+        target_keys = tuple(AMARA_TARGET_KEYS)
+    else:
+        target_keys = tuple(str(k) for k in raw_keys)
+        unknown = [k for k in target_keys if k not in AMARA_TARGET_KEYS]
+        if unknown:
+            raise ValueError(f"Unknown target_keys: {unknown}; expected subset of {AMARA_TARGET_KEYS}")
+
     return ModelConfig(
         architecture=model_top.get("architecture", "unet"),
         output_head=model_top.get("output_head", "single"),
@@ -189,6 +200,8 @@ def build_model_config(
         use_legacy=use_legacy,
         use_spectrum=use_spectrum,
         use_footprint_mask=use_footprint_model,
+        n_target_maps=len(target_keys),
+        target_keys=target_keys,
         imaging_resolution=imaging_resolution,  # type: ignore[arg-type]
         spatial_pipeline=model_top.get("spatial_pipeline", "symmetric"),
         footprint_mode=footprint_mode,

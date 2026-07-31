@@ -34,6 +34,10 @@ class ModelConfig:
     n_target_maps: int = len(AMARA_TARGET_KEYS)
     target_keys: tuple[str, ...] = field(default_factory=lambda: AMARA_TARGET_KEYS)
 
+    def sync_target_maps(self) -> None:
+        """Keep ``n_target_maps`` aligned with ``target_keys`` length."""
+        self.n_target_maps = len(self.target_keys)
+
     # Spatial input / output pipeline (swap via config without code changes).
     imaging_resolution: ImagingResolution = "aligned"
     spatial_pipeline: SpatialPipeline = "symmetric"
@@ -151,6 +155,12 @@ class ModelConfig:
         return self.backbone_input_channels()
 
     def validate(self) -> None:
+        if len(self.target_keys) == 0:
+            raise ValueError("target_keys must be non-empty")
+        if self.n_target_maps != len(self.target_keys):
+            raise ValueError(
+                f"n_target_maps={self.n_target_maps} != len(target_keys)={len(self.target_keys)}"
+            )
         if self.bottleneck_multiplier not in (8, 16):
             raise ValueError("bottleneck_multiplier must be 8 or 16")
         active = [w for w in self.loss_weights if w > 0]

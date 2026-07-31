@@ -1,0 +1,139 @@
+{
+  // Frozen-base residual models (all 6 Amara maps). Dedicated config — does not inherit HR/native UNet settings.
+  // Pixel:    python runner_residual.py --config config_residual_all.jsonc --variant pixel --run-name res_pix_all --autoinc
+  // LocalCNN: python runner_residual.py --config config_residual_all.jsonc --variant local_cnn --run-name res_cnn_all --autoinc
+  // Gaussian: python runner_residual.py --config config_residual_all.jsonc --variant gaussian --run-name res_gauss_all --autoinc
+  //
+  // Set residual.base_run_dir to a completed map-model run (config_used.json + ckpts/best.pt).
+
+  "training": {
+    "device": "cuda:0",
+    "seed": 42,
+    "epochs": 80,
+    "mixed_precision": false,
+    "grad_clip": 1.0,
+
+    "optimizer": {
+      "lr": 1e-3,
+      "weight_decay": 1e-4
+    },
+
+    "lr_schedule": {
+      "name": "warmup_cosine",
+      "warmup_epochs": 5,
+      "min_lr_ratio": 0.01
+    },
+
+    "batching": {
+      "train_batch_size": 16,
+      "eval_batch_size": 32,
+      "num_workers": 4
+    },
+
+    "early_stopping": {
+      "patience": 15,
+      "start_epoch": 10
+    },
+
+    "logging": {
+      "root_dir": "runs/residual",
+      "save_every_epochs": 5,
+      "write_plots": true,
+      "write_csv_history": true,
+      "save_config_snapshot": true,
+      "eval_max_plot": 8,
+      "eval_splits": ["val", "test"],
+      "run_post_train_eval": true
+    }
+  },
+
+  "data": {
+    "data_root": "manga_sdss_fits",
+    "use_sdss": true,
+    "use_legacy": false,
+    // Spectrum/HR must match the frozen base run's dataloader needs.
+    // Online base inference uses the base model's own config for its forward;
+    // this residual config only needs imaging + targets (+ whatever the base requires).
+    "use_spectrum": false,
+    "use_footprint_mask": true,
+    "imaging_resolution": "aligned",
+    "spectrum_mode": "fake",
+    "spectrum_fallback": true,
+    "require_all": true,
+
+    "augmentation": {
+      "enabled": true,
+      "hflip": true,
+      "vflip": true,
+      "rot90": true,
+      "p": 0.5
+    },
+
+    "split": {
+      "split_csv_path": "manga_sdss_fits/splits/default_split.csv",
+      "seed": 42,
+      "train_frac": 0.8,
+      "val_frac": 0.1,
+      "test_frac": 0.1
+    }
+  },
+
+  "residual": {
+    "base_run_dir": "runs/arch_ablation/arch_v1/runs/A_unet",
+    "base_checkpoint": "best.pt",
+    // null / "all" → use the full base target stack (must match model.target_keys).
+    "channel_key": null,
+    "variant": "pixel",
+    "hidden_channels": 32,
+    "n_residual_samples": 32,
+    "gaussian_l1_weight": 0.1,
+    // Online base inference (recommended): augmentation stays synchronised.
+    "cache_base_predictions": false
+  },
+
+  "model": {
+    "architecture": "unet",
+    "output_head": "single",
+    "target_keys": [
+      "ha_flux",
+      "hbeta_flux",
+      "oiii_5007_flux",
+      "nii_6584_flux",
+      "ha_ew",
+      "stellar_av"
+    ],
+
+    "imaging_resolution": "aligned",
+    "spatial_pipeline": "symmetric",
+    "footprint_mode": "loss_only",
+    "target_spatial_size": 76,
+    "use_hr_cross_attention": false,
+
+    "imaging_clamp_min": null,
+    "imaging_clamp_max": null,
+
+    "input_norm": {
+      "mode": "asinh",
+      "scales_path": "manga_sdss_fits/stats/input_asinh_scales.json",
+      "auto_compute": true,
+      "imaging_percentile": 99,
+      "spectrum_percentile": 99
+    },
+
+    "base_channels": 32,
+    "bottleneck_multiplier": 8,
+    "n_down": 2,
+    "dropout": 0.0,
+    "upsample_mode": "bilinear",
+    "norm": "gn",
+    "residual_blocks": false,
+    "cond_dim": 16,
+    "film_injection": "none",
+    "deep_supervision": false,
+
+    // Light final-map fidelity on top of primary residual_l1 in the wrapper.
+    "losses": ["l1", "grad", "laplacian"],
+    "loss_weights": [0.25, 0.1, 0.05],
+    "loss_params": {}
+  }
+}

@@ -148,8 +148,11 @@ class Trainer:
         self.logger = logger
         self.device = torch.device(train_cfg.device if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable:
+            raise ValueError("Model has no trainable parameters")
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            trainable,
             lr=train_cfg.lr,
             weight_decay=train_cfg.weight_decay,
         )
@@ -335,6 +338,10 @@ class Trainer:
 
 
 def _resolve_eval_fn(model):
+    if getattr(model, "uses_batch_forward_eval", False):
+        from src.metrics.residual_plots import evaluate_batch_forward_predictions
+
+        return evaluate_batch_forward_predictions
     cfg = getattr(model, "config", None)
     if cfg is not None and getattr(cfg, "output_head", None) == "gaussian":
         from src.metrics.uncertainty_plots import evaluate_uncertainty_predictions

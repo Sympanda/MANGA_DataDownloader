@@ -1,7 +1,8 @@
 # =============================================================================
 # Data & download caches (large; not versioned)
 # =============================================================================
-data/
+# Anchor to repo root so src/data/ (Python package) is not ignored.
+/data/
 manga_sdss_fits/
 legacy_coadd_brick_cache/
 sdss_spplate_cache/

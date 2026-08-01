@@ -441,6 +441,10 @@ def run_training(
                 eval_kwargs["ddim_steps"] = int(getattr(model, "ddim_steps", 50))
                 if getattr(model, "mode", None) == "corrector":
                     eval_kwargs["t_start_frac"] = float(getattr(model, "t_start_frac", 0.25))
+                else:
+                    fracs = getattr(model, "eval_t_start_fracs", None)
+                    if fracs:
+                        eval_kwargs["t_start_fracs"] = list(fracs)
             rows = eval_fn(
                 model,
                 split_loaders[split],

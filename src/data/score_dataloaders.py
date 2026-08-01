@@ -30,13 +30,14 @@ def make_score_dataloaders(
     *,
     coverage_csv: Path | str,
     min_coverage_pct: float = 99.0,
+    max_coverage_pct: float | None = None,
     feature: str = "ha_flux",
     use_stratified_weights: bool = True,
 ) -> tuple[DataLoader, DataLoader, DataLoader, DataLoader, list[str]]:
     """
     Build loaders with:
-    - train: train-split ∩ coverage threshold (+ optional stratified weights)
-    - val/test: original val/test ∩ coverage threshold (no reweighting)
+    - train: train-split ∩ coverage band (+ optional stratified weights)
+    - val/test: original val/test ∩ coverage band (no reweighting)
     """
     base = build_base_dataset(data_cfg)
     split_path = data_cfg.split_csv_path
@@ -47,6 +48,7 @@ def make_score_dataloaders(
         split="train",
         feature=feature,  # type: ignore[arg-type]
         min_coverage_pct=min_coverage_pct,
+        max_coverage_pct=max_coverage_pct,
     )
     val_ids = select_score_plateifus(
         coverage_csv=coverage_csv,
@@ -54,6 +56,7 @@ def make_score_dataloaders(
         split="val",
         feature=feature,  # type: ignore[arg-type]
         min_coverage_pct=min_coverage_pct,
+        max_coverage_pct=max_coverage_pct,
     )
     test_ids = select_score_plateifus(
         coverage_csv=coverage_csv,
@@ -61,6 +64,7 @@ def make_score_dataloaders(
         split="test",
         feature=feature,  # type: ignore[arg-type]
         min_coverage_pct=min_coverage_pct,
+        max_coverage_pct=max_coverage_pct,
     )
 
     train_aug = AugmentConfig(

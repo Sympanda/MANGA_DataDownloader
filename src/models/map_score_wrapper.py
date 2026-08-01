@@ -302,7 +302,7 @@ class MapScoreModel(nn.Module):
         use_ema: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Run reverse-process sampling and return maps in scaled target space."""
-        _, label_mask, footprint, base_ha = self._prepare_clean_map(batch)
+        y0, label_mask, footprint, base_ha = self._prepare_clean_map(batch)
         cond = self._spatial_cond(
             batch, footprint=footprint, label_mask=label_mask, base_ha=base_ha
         )
@@ -311,7 +311,11 @@ class MapScoreModel(nn.Module):
 
         n = int(n_samples or self.n_samples)
         steps = int(ddim_steps or self.ddim_steps)
-        frac = self.t_start_frac if t_start_frac is None else float(t_start_frac)
+        # None → mode default: corrector uses self.t_start_frac; generator = full noise.
+        if t_start_frac is None:
+            frac = None if self.mode == "generator" else float(self.t_start_frac)
+        else:
+            frac = float(t_start_frac)
 
         backup = None
         if use_ema and self.ema.shadow:
@@ -329,7 +333,7 @@ class MapScoreModel(nn.Module):
                     if base_ha is None:
                         raise RuntimeError("Corrector sampling requires base_ha")
                     x_init = self.score_norm.normalize(base_ha) * footprint
-                    t_start = self.schedule.t_from_fraction(frac)
+                    t_start = self.schedule.t_from_fraction(float(frac if frac is not None else self.t_start_frac))
                     y_k = self.schedule.ddim_sample(
                         self.denoiser,
                         cond,
@@ -342,18 +346,34 @@ class MapScoreModel(nn.Module):
                         spectrum=spec,
                     )
                 else:
-                    # Direct generator: never conditions on base; start from noise.
-                    y_k = self.schedule.ddim_sample(
-                        self.denoiser,
-                        cond,
-                        steps=steps,
-                        eta=eta,
-                        generator=gen,
-                        footprint_mask=footprint,
-                        x_init=None,
-                        t_start=None,
-                        spectrum=spec,
-                    )
+                    # Direct generator:
+                    #   frac is None or >=1 → pure noise (full map generation)
+                    #   0 < frac < 1 → noise the clean map to t and denoise
+                    if frac is None or frac >= 1.0 - 1e-12:
+                        y_k = self.schedule.ddim_sample(
+                            self.denoiser,
+                            cond,
+                            steps=steps,
+                            eta=eta,
+                            generator=gen,
+                            footprint_mask=footprint,
+                            x_init=None,
+                            t_start=None,
+                            spectrum=spec,
+                        )
+                    else:
+                        t_start = self.schedule.t_from_fraction(frac)
+                        y_k = self.schedule.ddim_sample(
+                            self.denoiser,
+                            cond,
+                            steps=steps,
+                            eta=eta,
+                            generator=gen,
+                            footprint_mask=footprint,
+                            x_init=y0,
+                            t_start=t_start,
+                            spectrum=spec,
+                        )
                 samples_score.append(y_k)
         finally:
             if backup is not None:

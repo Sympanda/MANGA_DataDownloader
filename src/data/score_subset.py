@@ -27,14 +27,17 @@ def select_score_plateifus(
     split: SplitName = "train",
     feature: CoverageFeature = "ha_flux",
     min_coverage_pct: float = 99.0,
+    max_coverage_pct: float | None = None,
 ) -> list[str]:
     """
-    Select galaxies from ``split`` with feature coverage ≥ threshold.
+    Select galaxies from ``split`` with feature coverage in
+    ``[min_coverage_pct, max_coverage_pct]`` (max inclusive when set).
 
     Dense validation/test galaxies are never pulled into training.
     """
     allowed = read_split_csv(split_csv)[split]
     cov_col = f"{feature}_pct"
+    max_cov = float("inf") if max_coverage_pct is None else float(max_coverage_pct)
     selected: list[str] = []
     for row in load_coverage_meta(coverage_csv):
         plateifu = row["plateifu"].strip()
@@ -44,7 +47,7 @@ def select_score_plateifus(
             cov = float(row[cov_col])
         except (KeyError, TypeError, ValueError):
             continue
-        if np.isfinite(cov) and cov >= float(min_coverage_pct):
+        if np.isfinite(cov) and float(min_coverage_pct) <= cov <= max_cov:
             selected.append(plateifu)
     return sorted(selected)
 

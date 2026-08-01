@@ -219,6 +219,8 @@ class Trainer:
                 if self.cfg.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                 self.optimizer.step()
+            if hasattr(self.model, "update_ema"):
+                self.model.update_ema()  # type: ignore[operator]
         else:
             self.model.eval()
             with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
@@ -338,6 +340,10 @@ class Trainer:
 
 
 def _resolve_eval_fn(model):
+    if getattr(model, "uses_score_sample_eval", False):
+        from src.metrics.score_plots import evaluate_score_samples
+
+        return evaluate_score_samples
     if getattr(model, "uses_batch_forward_eval", False):
         from src.metrics.residual_plots import evaluate_batch_forward_predictions
 
@@ -420,14 +426,25 @@ def run_training(
             continue
         logger.info(f"Evaluating split={split} ...")
         try:
+            eval_kwargs: dict[str, Any] = {
+                "device": trainer.device,
+                "map_keys": map_keys,
+                "plots_dir": plots_dir,
+                "split": split,
+                "max_plot": train_cfg.eval_max_plot
+                if split != "train"
+                else min(4, train_cfg.eval_max_plot),
+            }
+            # Score models: DDIM sample() kwargs live on the wrapper.
+            if getattr(model, "uses_score_sample_eval", False):
+                eval_kwargs["n_samples"] = int(getattr(model, "n_samples", 4))
+                eval_kwargs["ddim_steps"] = int(getattr(model, "ddim_steps", 50))
+                if getattr(model, "mode", None) == "corrector":
+                    eval_kwargs["t_start_frac"] = float(getattr(model, "t_start_frac", 0.25))
             rows = eval_fn(
                 model,
                 split_loaders[split],
-                device=trainer.device,
-                map_keys=map_keys,
-                plots_dir=plots_dir,
-                split=split,
-                max_plot=train_cfg.eval_max_plot if split != "train" else min(4, train_cfg.eval_max_plot),
+                **eval_kwargs,
             )
             csv_path = os.path.join(run_dirs["csv"], f"{split}_metrics.csv")
             write_metrics_csv(rows, csv_path)

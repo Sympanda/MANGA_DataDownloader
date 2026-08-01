@@ -1,0 +1,104 @@
+{
+  // Score corrector: SDEdit from frozen UNet Hα mean toward realistic full maps.
+  // python runner_score_corrector.py --config config_score_corrector.jsonc --run-name score_corr_ha99 --autoinc
+  // Compare t_start at eval: --t-start-frac 0.10 / 0.25 / 0.50
+
+  "training": {
+    "device": "cuda:1",
+    "seed": 42,
+    "epochs": 100,
+    "mixed_precision": false,
+    "grad_clip": 1.0,
+    "optimizer": { "lr": 2e-4, "weight_decay": 1e-4 },
+    "lr_schedule": { "name": "warmup_cosine", "warmup_epochs": 5, "min_lr_ratio": 0.01 },
+    "batching": { "train_batch_size": 8, "eval_batch_size": 4, "num_workers": 4 },
+    "early_stopping": { "patience": 20, "start_epoch": 20 },
+    "logging": {
+      "root_dir": "runs/score_corrector",
+      "save_every_epochs": 5,
+      "write_plots": true,
+      "write_csv_history": true,
+      "save_config_snapshot": true,
+      "eval_max_plot": 8,
+      "eval_splits": ["val"],
+      // DDIM sample panels (Target | Base UNet | mean | std | individuals).
+      "run_post_train_eval": true
+    }
+  },
+
+  "data": {
+    "data_root": "manga_sdss_fits",
+    "use_sdss": true,
+    "use_legacy": false,
+    "use_spectrum": true,
+    "use_footprint_mask": true,
+    "imaging_resolution": "aligned",
+    "spectrum_mode": "fake",
+    "spectrum_fallback": true,
+    "require_all": true,
+    "augmentation": { "enabled": true, "hflip": true, "vflip": true, "rot90": true, "p": 0.5 },
+    "split": {
+      "split_csv_path": "manga_sdss_fits/splits/default_split.csv",
+      "seed": 42,
+      "train_frac": 0.8,
+      "val_frac": 0.1,
+      "test_frac": 0.1
+    }
+  },
+
+  "score": {
+    "mode": "corrector",
+    "coverage_csv": "runs/dataset_audit/galaxy_coverage_meta.csv",
+    "min_coverage_pct": 99.0,
+    "feature": "ha_flux",
+    "use_stratified_weights": true,
+    "base_run_dir": "runs/arch_ablation/arch_v1/runs/A_unet",
+    "base_checkpoint": "best.pt",
+    "channel_key": "ha_flux",
+    "diffusion_steps": 1000,
+    "ddim_steps": 50,
+    "n_samples": 4,
+    "t_start_frac": 0.25,
+    "base_channels": 64,
+    "channel_mults": [1, 2, 4, 4],
+    "num_res_blocks": 2,
+    "schedule": "linear",
+    "ema_decay": 0.9999
+  },
+
+  "model": {
+    "architecture": "unet",
+    "output_head": "single",
+    "target_keys": ["ha_flux"],
+    "imaging_resolution": "aligned",
+    "spatial_pipeline": "symmetric",
+    "footprint_mode": "loss_only",
+    "target_spatial_size": 76,
+    "use_hr_cross_attention": false,
+    "imaging_clamp_min": null,
+    "imaging_clamp_max": null,
+    "input_norm": {
+      "mode": "asinh",
+      "scales_path": "manga_sdss_fits/stats/input_asinh_scales.json",
+      "auto_compute": true,
+      "imaging_percentile": 99,
+      "spectrum_percentile": 99
+    },
+    "base_channels": 64,
+    "bottleneck_multiplier": 8,
+    "n_down": 2,
+    "dropout": 0.0,
+    "upsample_mode": "bilinear",
+    "norm": "gn",
+    "residual_blocks": false,
+    "cond_dim": 128,
+    "film_injection": "encoder",
+    "spectrum_pooling": "attention",
+    "spectrum_use_wavelength": true,
+    "spectrum_use_ivar": true,
+    "deep_supervision": false,
+    "losses": ["mse"],
+    "loss_weights": [1.0],
+    "loss_params": {}
+  }
+}

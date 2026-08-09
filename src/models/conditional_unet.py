@@ -170,16 +170,28 @@ class ConditionalMapModel(nn.Module):
             )
 
         self.spectrum_encoder: SpectrumEncoder | None = None
+        self.redshift_encoder: nn.Module | None = None
         self.bottleneck_film: FiLM2d | None = None
         self.encoder_film: nn.ModuleList | None = None
 
-        if config.use_spectrum and config.film_injection != "none":
-            self.spectrum_encoder = SpectrumEncoder(
-                n_wave=config.spectrum_n_wave,
-                out_dim=config.cond_dim,
-                in_channels=config.spectrum_input_channels(),
-                pooling=config.spectrum_pooling,
-            )
+        needs_film = config.film_injection != "none" and (
+            config.use_spectrum or config.use_redshift_cond
+        )
+        if needs_film:
+            if config.use_spectrum:
+                self.spectrum_encoder = SpectrumEncoder(
+                    n_wave=config.spectrum_n_wave,
+                    out_dim=config.cond_dim,
+                    in_channels=config.spectrum_input_channels(),
+                    pooling=config.spectrum_pooling,
+                )
+            if config.use_redshift_cond:
+                # log1p(z) → cond_dim; added to spectrum FiLM vector when both are on.
+                self.redshift_encoder = nn.Sequential(
+                    nn.Linear(1, config.cond_dim),
+                    nn.SiLU(),
+                    nn.Linear(config.cond_dim, config.cond_dim),
+                )
             if config.film_injection == "bottleneck":
                 self.bottleneck_film = FiLM2d(
                     config.cond_dim,
@@ -413,6 +425,23 @@ class ConditionalMapModel(nn.Module):
             aux[f"ds_{i}"] = pred
         return maps, aux
 
+    def _build_cond(
+        self,
+        *,
+        spectrum: torch.Tensor | None,
+        redshift: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        cond = None
+        if self.spectrum_encoder is not None and spectrum is not None:
+            cond = self.spectrum_encoder(spectrum)
+        if self.redshift_encoder is not None:
+            if redshift is None:
+                raise ValueError("use_redshift_cond=true requires redshift in forward()")
+            z = redshift.reshape(-1, 1).to(dtype=torch.float32)
+            z_feat = self.redshift_encoder(torch.log1p(z.clamp_min(0.0)))
+            cond = z_feat if cond is None else cond + z_feat
+        return cond
+
     def forward(
         self,
         x_imaging: torch.Tensor,
@@ -421,12 +450,11 @@ class ConditionalMapModel(nn.Module):
         spectrum_flux: torch.Tensor | None = None,
         footprint: torch.Tensor | None = None,
         x_hr: torch.Tensor | None = None,
+        redshift: torch.Tensor | None = None,
         detail_scale_multiplier: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         spec = spectrum if spectrum is not None else spectrum_flux
-        cond = None
-        if self.spectrum_encoder is not None and spec is not None:
-            cond = self.spectrum_encoder(spec)
+        cond = self._build_cond(spectrum=spec, redshift=redshift)
 
         self._hr_cross_pyramid = None
         if self.config.use_hr_cross_attn:

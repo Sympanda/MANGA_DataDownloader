@@ -200,6 +200,16 @@ Full re-export (new galaxies or changed scaling):
 python -m manga_prep export-pipe3d-maps --in-place --data-root manga_sdss_fits --workers 8
 ```
 
+Physical-property maps (separate NPZ; does not overwrite `amara_maps.npz`):
+
+```bash
+python -m manga_prep export-pipe3d-phys-maps \
+  --in-place --include-derived --drpall drpall-v3_1_1.fits \
+  --data-root manga_sdss_fits --workers 8
+```
+
+See `manga_prep/targets/README.md` for keys, S/N masks, and global SF flags.
+
 ## Target scaling (Amara defaults)
 
 Documented in `manga_prep/targets/README.md`. Summary:

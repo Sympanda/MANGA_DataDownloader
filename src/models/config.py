@@ -27,6 +27,7 @@ class ModelConfig:
     use_sdss: bool = True
     use_legacy: bool = False
     use_spectrum: bool = True
+    use_redshift_cond: bool = False
     use_footprint_mask: bool = True
 
     n_sdss_bands: int = 5
@@ -229,6 +230,10 @@ class ModelConfig:
                         f"deep_supervision_weights must have length n_down-1={expected}, "
                         f"got {len(self.deep_supervision_weights)}"
                     )
+        if self.film_injection != "none" and not (self.use_spectrum or self.use_redshift_cond):
+            raise ValueError(
+                "film_injection != 'none' requires use_spectrum and/or use_redshift_cond"
+            )
         if self.input_norm_mode == "asinh":
             if self.imaging_asinh_scales is None:
                 raise ValueError(

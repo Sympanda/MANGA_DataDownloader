@@ -82,6 +82,15 @@ def build_data_config(
     grid_raw = data_top.get("imaging_grid", None)
     imaging_grid = None if grid_raw is None else str(grid_raw)
     hr_survey = str(model_top.get("hr_survey", data_top.get("hr_survey", "sdss")))
+    raw_keys = data_top.get("target_keys", model_top.get("target_keys"))
+    target_keys = None if raw_keys is None else tuple(str(k) for k in raw_keys)
+    sf_flag = data_top.get("galaxy_sf_flag", None)
+    min_snr_raw = data_top.get("min_snr", None)
+    fill_raw = data_top.get("min_footprint_fill", None)
+    n_pix_raw = data_top.get("min_valid_pixels", None)
+    use_redshift_cond = bool(model_top.get("use_redshift_cond", False))
+    include_redshift = bool(data_top.get("include_redshift", use_redshift_cond))
+    require_redshift = bool(data_top.get("require_redshift", use_redshift_cond))
     return DataConfig(
         data_root=Path(data_top.get("data_root", "manga_sdss_fits")),
         index_path=Path(data_top["index_path"]) if data_top.get("index_path") else None,
@@ -92,6 +101,15 @@ def build_data_config(
         spectrum_mode=str(data_top.get("spectrum_mode", "fake")),
         spectrum_fallback=bool(data_top.get("spectrum_fallback", True)),
         use_footprint_mask=bool(data_top.get("use_footprint_mask", True)),
+        target_source=str(data_top.get("target_source", "amara")),  # type: ignore[arg-type]
+        target_keys=target_keys,
+        min_snr=None if min_snr_raw is None else float(min_snr_raw),
+        galaxy_sf_flag=None if sf_flag in (None, "", False) else str(sf_flag),  # type: ignore[arg-type]
+        require_sf_spaxel=bool(data_top.get("require_sf_spaxel", False)),
+        min_footprint_fill=None if fill_raw is None else float(fill_raw),
+        min_valid_pixels=None if n_pix_raw is None else float(n_pix_raw),
+        include_redshift=include_redshift,
+        require_redshift=require_redshift,
         imaging_resolution=resolution,  # type: ignore[arg-type]
         aligned_oversample=aligned_oversample,
         imaging_grid=imaging_grid,  # type: ignore[arg-type]
@@ -183,15 +201,28 @@ def build_model_config(
         clamp_max = None
 
     from manga_prep.targets.pipe3d_maps import AMARA_TARGET_KEYS
+    from manga_prep.targets.pipe3d_phys_maps import AMARA_PHYS_DERIVED_KEYS, AMARA_PHYS_DIRECT_KEYS
 
-    raw_keys = model_top.get("target_keys")
+    target_source = str(data_top.get("target_source", "amara"))
+    if target_source == "phys":
+        allowed_keys = tuple(AMARA_PHYS_DIRECT_KEYS) + tuple(AMARA_PHYS_DERIVED_KEYS)
+        default_keys = tuple(AMARA_PHYS_DIRECT_KEYS)
+    else:
+        allowed_keys = tuple(AMARA_TARGET_KEYS)
+        default_keys = tuple(AMARA_TARGET_KEYS)
+    allowed_set = set(allowed_keys)
+
+    raw_keys = model_top.get("target_keys", data_top.get("target_keys"))
     if raw_keys is None:
-        target_keys = tuple(AMARA_TARGET_KEYS)
+        target_keys = default_keys
     else:
         target_keys = tuple(str(k) for k in raw_keys)
-        unknown = [k for k in target_keys if k not in AMARA_TARGET_KEYS]
+        unknown = [k for k in target_keys if k not in allowed_set]
         if unknown:
-            raise ValueError(f"Unknown target_keys: {unknown}; expected subset of {AMARA_TARGET_KEYS}")
+            raise ValueError(
+                f"Unknown target_keys for target_source={target_source!r}: {unknown}; "
+                f"expected subset of {allowed_keys}"
+            )
 
     return ModelConfig(
         architecture=model_top.get("architecture", "unet"),
@@ -199,6 +230,7 @@ def build_model_config(
         use_sdss=use_sdss,
         use_legacy=use_legacy,
         use_spectrum=use_spectrum,
+        use_redshift_cond=bool(model_top.get("use_redshift_cond", False)),
         use_footprint_mask=use_footprint_model,
         n_target_maps=len(target_keys),
         target_keys=target_keys,
@@ -437,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     set_seed(train_cfg.seed)
+    print("Building dataset (SF / coverage / redshift pre-checks)...", flush=True)
     base_dataset = build_base_dataset(data_cfg)
     dl_train, dl_val, dl_test, dl_train_ns = make_manga_dataloaders(
         data_cfg,
@@ -445,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             "eval_batch_size": train_cfg.eval_batch_size,
             "num_workers": training_top.get("batching", {}).get("num_workers", 0),
         },
+        base=base_dataset,
     )
 
     model = MapGenerator(model_cfg)
@@ -452,10 +486,28 @@ def main(argv: list[str] | None = None) -> int:
     print("MaNGA map training")
     print("=" * 60)
     print(f"  run          : {run_name}")
+    n_train = len(dl_train.dataset)  # type: ignore[arg-type]
+    n_val = len(dl_val.dataset)  # type: ignore[arg-type]
+    n_test = len(dl_test.dataset)  # type: ignore[arg-type]
+    print(
+        f"  galaxies     : pool={len(base_dataset):,}  "
+        f"train/val/test={n_train:,}/{n_val:,}/{n_test:,}"
+    )
+    if data_cfg.galaxy_sf_flag is not None:
+        print(f"  SF filter    : {data_cfg.galaxy_sf_flag}")
+    if data_cfg.min_footprint_fill is not None or data_cfg.min_valid_pixels is not None:
+        fill = data_cfg.min_footprint_fill
+        fill_s = "None" if fill is None else f"{fill:.0%}"
+        print(
+            f"  coverage     : min_footprint_fill={fill_s}  "
+            f"min_valid_pixels={data_cfg.min_valid_pixels}"
+        )
     print(f"  train/val/test batches: {len(dl_train)}/{len(dl_val)}/{len(dl_test)}")
     print(f"  architecture : {model_cfg.architecture}  head={model_cfg.output_head}")
     print(
         f"  conditioning : film={model_cfg.film_injection}  "
+        f"spectrum={model_cfg.use_spectrum}  "
+        f"redshift={model_cfg.use_redshift_cond}  "
         f"deep_supervision={model_cfg.deep_supervision}"
     )
     print(f"  spatial pipe : {model_cfg.spatial_pipeline}  imaging={model_cfg.imaging_resolution} (grid={data_cfg.resolve_imaging_grid()})")

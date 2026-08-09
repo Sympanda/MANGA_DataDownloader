@@ -49,6 +49,11 @@ class SpectrumPrepConfig(Protocol):
 
 
 @runtime_checkable
+class RedshiftPrepConfig(Protocol):
+    use_redshift_cond: bool
+
+
+@runtime_checkable
 class TargetPrepConfig(Protocol):
     target_keys: tuple[str, ...]
 
@@ -197,6 +202,21 @@ def prepare_spectrum_input(batch: dict[str, object], config: SpectrumPrepConfig)
         channels.append(torch.log1p(ivar_t))
 
     return torch.stack(channels, dim=1)
+
+
+def prepare_redshift_input(
+    batch: dict[str, object],
+    config: RedshiftPrepConfig,
+) -> torch.Tensor | None:
+    """Return ``(B,)`` redshifts when ``use_redshift_cond`` is enabled."""
+    if not getattr(config, "use_redshift_cond", False):
+        return None
+    if "redshift" not in batch:
+        raise KeyError("Batch missing 'redshift' required by use_redshift_cond")
+    z = batch["redshift"]
+    if not torch.is_tensor(z):
+        z = torch.as_tensor(z, dtype=torch.float32)
+    return z.float().reshape(-1)
 
 
 def prepare_targets_and_masks(

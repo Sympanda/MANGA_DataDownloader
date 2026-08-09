@@ -8,6 +8,7 @@ we should drive train error near zero.
 
 Usage:
   python scripts/overfit_tiny.py --config config.jsonc --n-galaxies 32 --run-name overfit_32 --autoinc
+  python scripts/overfit_tiny.py --config config_phys_overfit.jsonc --n-galaxies 16 --run-name phys_overfit_16 --autoinc
   python scripts/overfit_tiny.py --config config.jsonc --n-galaxies 32 --epochs 500 --device cuda:0
 """
 from __future__ import annotations
@@ -28,7 +29,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from manga_prep.dataset.manga_dataset import collate_manga_batch  # noqa: E402
-from manga_prep.targets.pipe3d_maps import load_amara_training_targets  # noqa: E402
+from manga_prep.dataset.map_coverage import map_coverage_stats  # noqa: E402
 from runner import (  # noqa: E402
     _describe_inputs,
     _resolve_run_name,
@@ -48,22 +49,11 @@ from src.models.wrapper import (  # noqa: E402
     prepare_footprint_input,
     prepare_hr_imaging_input,
     prepare_imaging_input,
+    prepare_redshift_input,
     prepare_spectrum_input,
     prepare_targets_and_masks,
 )
 from src.training.train import run_training  # noqa: E402
-
-
-def _valid_pixel_count(galaxy_dir: Path) -> int:
-    try:
-        bundle = load_amara_training_targets(galaxy_dir, scaled=True)
-    except Exception:
-        return 0
-    masks = bundle["target_loss_masks"]
-    total = 0
-    for m in masks.values():
-        total += int(np.asarray(m).sum())
-    return total
 
 
 def _select_plateifus(
@@ -72,31 +62,49 @@ def _select_plateifus(
     source_split_csv: Path,
     n: int,
     seed: int,
-) -> list[tuple[str, int]]:
-    """Pick top-n train galaxies by supervised pixel count (tie-break by seed shuffle)."""
+) -> list[tuple[str, float, float]]:
+    """
+    Pick top-n train galaxies by footprint fill fraction, then mean valid pixels.
+
+    Ranking by fill first avoids punishing small IFUs that are still well labelled.
+    """
     train_rows = filter_rows_by_split(base.rows, source_split_csv, "train")
-    print(f"Scoring {len(train_rows):,} train galaxies by valid supervised pixels...", flush=True)
-    scored: list[tuple[str, int]] = []
+    print(
+        f"Scoring {len(train_rows):,} train galaxies by fill fraction "
+        f"+ mean valid pixels...",
+        flush=True,
+    )
+    target_keys = tuple(base.target_keys)
+    scored: list[tuple[str, float, float]] = []
     for row in tqdm(train_rows, desc="Select overfit galaxies", unit="gal", dynamic_ncols=True):
         gdir = base.data_root / row["galaxy_dir"]
-        scored.append((row["plateifu"], _valid_pixel_count(gdir)))
+        n_mean, _fp_n, fill = map_coverage_stats(
+            gdir,
+            target_source=base.target_source,
+            target_keys=target_keys,
+            min_snr=base.min_snr,
+            require_sf_spaxel=base.require_sf_spaxel,
+        )
+        scored.append((row["plateifu"], fill, n_mean))
 
     rng = np.random.default_rng(seed)
-    # Stable shuffle then sort by pixel count descending so ties are randomized.
     order = np.arange(len(scored))
     rng.shuffle(order)
     scored = [scored[i] for i in order]
-    scored.sort(key=lambda t: t[1], reverse=True)
+    # Primary: fill_frac; secondary: mean valid pixels (both descending).
+    scored.sort(key=lambda t: (t[1], t[2]), reverse=True)
 
-    picked = [t for t in scored if t[1] > 0][:n]
+    picked = [t for t in scored if t[1] > 0 and t[2] > 0][:n]
     if len(picked) < n:
         raise SystemExit(
-            f"Only found {len(picked)} train galaxies with valid pixels "
-            f"(requested {n}). Check data_root / amara_maps.npz."
+            f"Only found {len(picked)} train galaxies with valid coverage "
+            f"(requested {n}). Check data_root / target maps "
+            f"(source={base.target_source!r})."
         )
     print(
         f"Selected {len(picked)} galaxies "
-        f"(valid pixels: {picked[-1][1]:,} .. {picked[0][1]:,})",
+        f"(fill: {picked[-1][1]:.2%} .. {picked[0][1]:.2%}; "
+        f"mean valid px: {picked[-1][2]:.0f} .. {picked[0][2]:.0f})",
         flush=True,
     )
     return picked
@@ -135,11 +143,20 @@ def _train_fit_report(
         spec = prepare_spectrum_input(batch, model.config)
         if spec is not None:
             spec = spec.to(device)
+        redshift = prepare_redshift_input(batch, model.config)
+        if redshift is not None:
+            redshift = redshift.to(device)
         targets, masks = prepare_targets_and_masks(batch, model.config)
         targets = targets.to(device)
         masks = masks.to(device)
 
-        pred, _ = model.model(x, spectrum_flux=spec, footprint=footprint, x_hr=x_hr)
+        pred, _ = model.model(
+            x,
+            spectrum_flux=spec,
+            footprint=footprint,
+            x_hr=x_hr,
+            redshift=redshift,
+        )
         bsz = pred.shape[0]
         for i in range(bsz):
             sample_l1, sample_mse = [], []
@@ -286,17 +303,26 @@ def main() -> int:
         n=args.n_galaxies,
         seed=train_cfg.seed,
     )
-    plateifus = [p for p, _ in picked]
+    plateifus = [p for p, _fill, _n in picked]
 
     run_dir = save_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     tiny_split = run_dir / "tiny_split.csv"
     _write_tiny_split(tiny_split, plateifus)
     with (run_dir / "tiny_galaxies.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=["plateifu", "n_valid_pixels"])
+        w = csv.DictWriter(
+            fh,
+            fieldnames=["plateifu", "fill_frac", "n_valid_mean"],
+        )
         w.writeheader()
-        for p, n_pix in picked:
-            w.writerow({"plateifu": p, "n_valid_pixels": n_pix})
+        for p, fill, n_mean in picked:
+            w.writerow(
+                {
+                    "plateifu": p,
+                    "fill_frac": f"{fill:.6f}",
+                    "n_valid_mean": f"{n_mean:.3f}",
+                }
+            )
 
     data_cfg.split_csv_path = tiny_split
     data_cfg.augmentation = AugmentConfig(enabled=False)
@@ -345,6 +371,10 @@ def main() -> int:
             "n_galaxies": args.n_galaxies,
             "plateifus": plateifus,
             "source_split": str(source_split),
+            "target_source": data_cfg.target_source,
+            "target_keys": list(model_cfg.target_keys),
+            "min_snr": data_cfg.min_snr,
+            "galaxy_sf_flag": data_cfg.galaxy_sf_flag,
             "dropout": 0.0,
             "augmentation": False,
             "weight_decay": 0.0,
@@ -356,6 +386,10 @@ def main() -> int:
     print("MaNGA overfit-tiny (train-only capacity check)")
     print("=" * 60)
     print(f"  run          : {run_name}")
+    print(f"  target_source: {data_cfg.target_source}")
+    print(f"  target_keys  : {tuple(model_cfg.target_keys)}")
+    if data_cfg.target_source == "phys":
+        print(f"  min_snr      : {data_cfg.min_snr}  sf_flag={data_cfg.galaxy_sf_flag}")
     print(f"  n galaxies   : {len(plateifus)}  (top valid-pixel train subset)")
     print(f"  pixels/gal   : min={picked[-1][1]:,}  max={picked[0][1]:,}")
     print(f"  epochs       : {train_cfg.epochs}")

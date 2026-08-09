@@ -14,11 +14,18 @@ from pathlib import Path
 
 from astropy.io import fits
 
-from manga_prep.io.aligned_cache import aligned_legacy_path_from_row, aligned_sdss_path_from_row
-
 _DIR_RE = re.compile(r"^(\d+)_(\d+)$")
 _SDSS_BANDS = ("u", "g", "r", "i", "z")
 _LEGACY_BANDS = ("g", "r", "i", "z")
+_ALIGNED_SUBDIR = "aligned_imaging"
+
+
+def _aligned_sdss_cache(gal_dir: Path) -> Path:
+    return gal_dir / _ALIGNED_SUBDIR / "sdss_aligned.npz"
+
+
+def _aligned_legacy_cache(gal_dir: Path) -> Path:
+    return gal_dir / _ALIGNED_SUBDIR / "legacy_aligned.npz"
 
 _INDEX_FIELDS = (
     "plateifu",
@@ -30,14 +37,32 @@ _INDEX_FIELDS = (
     "sdss_imaging_valid",
     "legacy_imaging_valid",
     "has_amara_maps",
+    "has_amara_phys_maps",
     "has_fake_spectrum",
     "has_real_spectrum",
     "amara_maps_npz",
+    "amara_phys_maps_npz",
     "fake_spectrum_npz",
     "real_spectrum_npz",
     "sdss_cutouts_dir",
     "legacy_cutouts_dir",
+    "global_bpt_class_code",
+    "global_bpt_sf",
+    "global_bpt_sf_strict",
+    "global_sf_ew_strict",
 )
+
+def _load_global_flags_table(path: Path | None) -> dict[str, dict]:
+    if path is None or not _nonempty(path):
+        return {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    out: dict[str, dict] = {}
+    for row in rows:
+        plateifu = str(row.get("plateifu", "")).strip()
+        if plateifu:
+            out[plateifu] = row
+    return out
 
 
 def _nonempty(path: Path) -> bool:
@@ -64,24 +89,22 @@ def _consistent_band_shapes(paths: list[Path]) -> bool:
 
 
 def sdss_imaging_ready(data_root: Path, row: dict) -> bool:
-    cache_path = aligned_sdss_path_from_row(data_root, row)
-    if _nonempty(cache_path):
+    gal_dir = data_root / row["galaxy_dir"]
+    if _nonempty(_aligned_sdss_cache(gal_dir)):
         return True
     if "sdss_imaging_valid" in row and row["sdss_imaging_valid"] is not None:
         return bool(row["sdss_imaging_valid"])
-    gal_dir = data_root / row["galaxy_dir"]
     plate, ifu = row["plateifu"].split("-", 1)
     paths = [gal_dir / "sdss_cutouts" / f"sdss-{plate}-{ifu}-{b}.fits" for b in _SDSS_BANDS]
     return _consistent_band_shapes(paths)
 
 
 def legacy_imaging_ready(data_root: Path, row: dict) -> bool:
-    cache_path = aligned_legacy_path_from_row(data_root, row)
-    if _nonempty(cache_path):
+    gal_dir = data_root / row["galaxy_dir"]
+    if _nonempty(_aligned_legacy_cache(gal_dir)):
         return True
     if "legacy_imaging_valid" in row and row["legacy_imaging_valid"] is not None:
         return bool(row["legacy_imaging_valid"])
-    gal_dir = data_root / row["galaxy_dir"]
     plate, ifu = row["plateifu"].split("-", 1)
     grz = [gal_dir / "legacy_cutouts" / f"legacy-{plate}-{ifu}-{b}.fits" for b in ("g", "r", "z")]
     griz = [gal_dir / "legacy_cutouts" / f"legacy-{plate}-{ifu}-{b}.fits" for b in _LEGACY_BANDS]
@@ -104,7 +127,12 @@ def _ra_dec_from_metadata(meta: dict | None) -> tuple[float | None, float | None
     return float(ra), float(dec)
 
 
-def inspect_galaxy_index_row(gal_dir: Path, *, data_root: Path | None = None) -> dict:
+def inspect_galaxy_index_row(
+    gal_dir: Path,
+    *,
+    data_root: Path | None = None,
+    global_flags: dict[str, dict] | None = None,
+) -> dict:
     """Return one index row for a manga_sdss_fits/<plate>_<ifu>/ folder."""
     m = _DIR_RE.match(gal_dir.name)
     if not m:
@@ -130,6 +158,8 @@ def inspect_galaxy_index_row(gal_dir: Path, *, data_root: Path | None = None) ->
 
     amara_maps_npz = gal_dir / "amara_maps.npz"
     has_amara_maps = _nonempty(amara_maps_npz)
+    amara_phys_maps_npz = gal_dir / "amara_phys_maps.npz"
+    has_amara_phys_maps = _nonempty(amara_phys_maps_npz)
 
     fake_matches = sorted((gal_dir / "fake_sdss_spectra").glob("manga-*-fake-sdss-spectrum-*.npz"))
     fake_spectrum_npz = fake_matches[0] if fake_matches and _nonempty(fake_matches[0]) else None
@@ -144,6 +174,7 @@ def inspect_galaxy_index_row(gal_dir: Path, *, data_root: Path | None = None) ->
         sdss_dir / "metadata.json",
         gal_dir / "fake_sdss_spectra" / "metadata.json",
         gal_dir / "amara_maps_metadata.json",
+        gal_dir / "amara_phys_maps_metadata.json",
         legacy_dir / "metadata.json",
     ):
         ra_deg, dec_deg = _ra_dec_from_metadata(_read_json(meta_path))
@@ -168,6 +199,7 @@ def inspect_galaxy_index_row(gal_dir: Path, *, data_root: Path | None = None) ->
                 pass
         return str(path)
 
+    flag_row = (global_flags or {}).get(plateifu, {})
     return {
         "plateifu": plateifu,
         "galaxy_dir": galaxy_dir_str.replace("\\", "/"),
@@ -178,24 +210,41 @@ def inspect_galaxy_index_row(gal_dir: Path, *, data_root: Path | None = None) ->
         "sdss_imaging_valid": sdss_imaging_valid,
         "legacy_imaging_valid": legacy_imaging_valid,
         "has_amara_maps": has_amara_maps,
+        "has_amara_phys_maps": has_amara_phys_maps,
         "has_fake_spectrum": has_fake_spectrum,
         "has_real_spectrum": has_real_spectrum,
         "amara_maps_npz": _rel(amara_maps_npz if has_amara_maps else None),
+        "amara_phys_maps_npz": _rel(amara_phys_maps_npz if has_amara_phys_maps else None),
         "fake_spectrum_npz": _rel(fake_spectrum_npz),
         "real_spectrum_npz": _rel(real_spectrum_npz),
         "sdss_cutouts_dir": _rel(sdss_dir if has_sdss_imaging else None),
         "legacy_cutouts_dir": _rel(legacy_dir if has_legacy_imaging else None),
+        "global_bpt_class_code": flag_row.get("global_bpt_class_code", ""),
+        "global_bpt_sf": flag_row.get("global_bpt_sf", ""),
+        "global_bpt_sf_strict": flag_row.get("global_bpt_sf_strict", ""),
+        "global_sf_ew_strict": flag_row.get("global_sf_ew_strict", ""),
     }
 
 
-def build_manga_dataset_index(data_root: Path, *, galaxy_dirs: list[Path] | None = None) -> list[dict]:
+def build_manga_dataset_index(
+    data_root: Path,
+    *,
+    galaxy_dirs: list[Path] | None = None,
+    global_flags_csv: Path | None = None,
+) -> list[dict]:
     """Scan data_root and return index rows sorted by plateifu."""
     data_root = Path(data_root)
     if galaxy_dirs is None:
         galaxy_dirs = sorted(
             p for p in data_root.iterdir() if p.is_dir() and _DIR_RE.match(p.name)
         )
-    rows = [inspect_galaxy_index_row(gal_dir, data_root=data_root) for gal_dir in galaxy_dirs]
+    if global_flags_csv is None:
+        global_flags_csv = data_root / "pipe3d_global_flags.csv"
+    global_flags = _load_global_flags_table(global_flags_csv)
+    rows = [
+        inspect_galaxy_index_row(gal_dir, data_root=data_root, global_flags=global_flags)
+        for gal_dir in galaxy_dirs
+    ]
     rows.sort(key=lambda row: row["plateifu"])
     return rows
 
@@ -235,7 +284,14 @@ def read_manga_dataset_index(index_path: Path) -> list[dict]:
         "has_fake_spectrum",
         "has_real_spectrum",
     )
-    optional_flags = ("sdss_imaging_valid", "legacy_imaging_valid")
+    optional_flags = (
+        "sdss_imaging_valid",
+        "legacy_imaging_valid",
+        "has_amara_phys_maps",
+        "global_bpt_sf",
+        "global_bpt_sf_strict",
+        "global_sf_ew_strict",
+    )
 
     for row in rows:
         for flag in required_flags:
@@ -243,6 +299,13 @@ def read_manga_dataset_index(index_path: Path) -> list[dict]:
         for flag in optional_flags:
             if flag in fieldnames:
                 row[flag] = _parse_optional_bool_field(row.get(flag))
+            elif flag == "has_amara_phys_maps":
+                row[flag] = False
+        if "global_bpt_class_code" in fieldnames:
+            raw = str(row.get("global_bpt_class_code") or "").strip()
+            row["global_bpt_class_code"] = int(raw) if raw.isdigit() else None
+        else:
+            row["global_bpt_class_code"] = None
     return rows
 
 
@@ -253,6 +316,7 @@ def summarize_index(rows: list[dict]) -> dict[str, int]:
         "has_sdss_imaging": sum(1 for r in rows if r["has_sdss_imaging"]),
         "has_legacy_imaging": sum(1 for r in rows if r["has_legacy_imaging"]),
         "has_amara_maps": sum(1 for r in rows if r["has_amara_maps"]),
+        "has_amara_phys_maps": sum(1 for r in rows if r.get("has_amara_phys_maps")),
         "has_fake_spectrum": sum(1 for r in rows if r["has_fake_spectrum"]),
         "has_real_spectrum": sum(1 for r in rows if r["has_real_spectrum"]),
         "has_maps_and_fake_spectrum": sum(
@@ -266,6 +330,7 @@ def summarize_index(rows: list[dict]) -> dict[str, int]:
             and r["has_amara_maps"]
             and r["has_fake_spectrum"]
         ),
+        "global_bpt_sf": sum(1 for r in rows if r.get("global_bpt_sf")),
     }
 
 
@@ -281,12 +346,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Output CSV path (default: <data-root>/manga_dataset_index.csv)",
     )
+    parser.add_argument(
+        "--global-flags-csv",
+        type=Path,
+        default=None,
+        help="Optional Pipe3D global flags CSV (default: <data-root>/pipe3d_global_flags.csv).",
+    )
     args = parser.parse_args(argv)
 
     if not args.data_root.is_dir():
         raise SystemExit(f"Missing data root: {args.data_root}")
 
-    rows = build_manga_dataset_index(args.data_root)
+    rows = build_manga_dataset_index(args.data_root, global_flags_csv=args.global_flags_csv)
     out_path = args.out or (args.data_root / "manga_dataset_index.csv")
     write_manga_dataset_index(rows, out_path)
 

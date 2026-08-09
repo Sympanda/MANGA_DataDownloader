@@ -1,27 +1,24 @@
 {
-  // Score corrector: SDEdit from frozen UNet Hα mean toward realistic full maps.
-  // python runner_score_corrector.py --config config_score_corrector.jsonc --run-name score_corr_ha99 --autoinc
-  // Compare t_start at eval: --t-start-frac 0.10 / 0.25 / 0.50
-
+  // Conditional 16-galaxy forced-overfit: photometry → Ha from noise.
+  // python runner_score_overfit.py --config config_score_overfit_cond.jsonc --run-name score_overfit_cond --autoinc
   "training": {
     "device": "cuda:1",
     "seed": 42,
-    "epochs": 100,
+    "epochs": 400,
     "mixed_precision": false,
     "grad_clip": 1.0,
-    "optimizer": { "lr": 2e-4, "weight_decay": 1e-4 },
-    "lr_schedule": { "name": "warmup_cosine", "warmup_epochs": 5, "min_lr_ratio": 0.01 },
-    "batching": { "train_batch_size": 8, "eval_batch_size": 4, "num_workers": 4 },
-    "early_stopping": { "patience": 20, "start_epoch": 20 },
+    "optimizer": { "lr": 0.0002, "weight_decay": 0.0 },
+    "lr_schedule": { "name": "warmup_cosine", "warmup_epochs": 10, "min_lr_ratio": 0.01 },
+    "batching": { "train_batch_size": 4, "eval_batch_size": 4, "num_workers": 2 },
+    "early_stopping": { "patience": 200, "start_epoch": 50 },
     "logging": {
-      "root_dir": "runs/score_corrector",
-      "save_every_epochs": 5,
+      "root_dir": "runs/score_overfit",
+      "save_every_epochs": 50,
       "write_plots": true,
       "write_csv_history": true,
       "save_config_snapshot": true,
       "eval_max_plot": 8,
-      "eval_splits": ["val"],
-      // DDIM sample panels (Target | Base UNet | mean | std | individuals).
+      "eval_splits": ["train"],
       "run_post_train_eval": true
     }
   },
@@ -47,27 +44,30 @@
   },
 
   "score": {
-    "mode": "corrector",
+    "mode": "generator",
+    "unconditional": false,
+    "condition_on_label_mask": false,
+    "n_galaxies": 16,
     "coverage_csv": "runs/dataset_audit/galaxy_coverage_meta.csv",
     "min_coverage_pct": 99.0,
     "feature": "ha_flux",
-    "use_stratified_weights": true,
+    "use_stratified_weights": false,
     "base_run_dir": "runs/arch_ablation/arch_v1/runs/A_unet",
     "base_checkpoint": "best.pt",
     "channel_key": "ha_flux",
     "diffusion_steps": 1000,
     "ddim_steps": 50,
     "n_samples": 4,
-    "t_start_frac": 0.25,
+    "eval_t_start_fracs": [1.0],
     "base_channels": 64,
     "channel_mults": [1, 2, 4, 4],
     "num_res_blocks": 2,
-    "schedule": "linear",
-    "ema_decay": 0.9999,
-    "condition_on_label_mask": false,
-    "use_min_snr": false,
+    "schedule": "cosine",
+    "ema_decay": 0.999,
+    "use_min_snr": true,
     "min_snr_gamma": 5.0,
-    "use_bottleneck_attn": false
+    "use_bottleneck_attn": true,
+    "attn_heads": 4
   },
 
   "model": {
@@ -79,8 +79,7 @@
     "footprint_mode": "loss_only",
     "target_spatial_size": 76,
     "use_hr_cross_attention": false,
-    "imaging_clamp_min": null,
-    "imaging_clamp_max": null,
+    "use_spectrum": true,
     "input_norm": {
       "mode": "asinh",
       "scales_path": "manga_sdss_fits/stats/input_asinh_scales.json",
@@ -88,21 +87,7 @@
       "imaging_percentile": 99,
       "spectrum_percentile": 99
     },
-    "base_channels": 64,
-    "bottleneck_multiplier": 8,
-    "n_down": 2,
-    "dropout": 0.0,
-    "upsample_mode": "bilinear",
-    "norm": "gn",
-    "residual_blocks": false,
-    "cond_dim": 128,
-    "film_injection": "encoder",
-    "spectrum_pooling": "attention",
-    "spectrum_use_wavelength": true,
-    "spectrum_use_ivar": true,
-    "deep_supervision": false,
-    "losses": ["mse"],
-    "loss_weights": [1.0],
-    "loss_params": {}
+    "losses": ["l1"],
+    "loss_weights": [1.0]
   }
 }

@@ -8,6 +8,7 @@ import torch
 from src.models.losses import (
     compose_map_losses,
     masked_charbonnier,
+    masked_fft_power_loss,
     masked_integration_loss,
     masked_l1,
     masked_laplacian_loss,
@@ -134,6 +135,27 @@ class MaskedLossTests(unittest.TestCase):
         loss = masked_integration_loss(pred, target, mask, channel_indices=[0], normalize="mean")
         # valid pixels = 4, means: 1 vs 2 -> |4-8|/4 = 1
         self.assertAlmostEqual(float(loss.item()), 1.0, places=4)
+
+    def test_fft_power_zero_when_identical(self) -> None:
+        pred, target, mask = self._sample()
+        # Copy valid region so power spectra match inside the mask support.
+        tgt = torch.where(mask > 0, pred, target)
+        loss = masked_fft_power_loss(pred, tgt, mask)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertAlmostEqual(float(loss.item()), 0.0, places=5)
+
+    def test_fft_power_in_compose(self) -> None:
+        pred, target, mask = self._sample()
+        out = compose_map_losses(
+            pred,
+            target,
+            mask,
+            losses=["l1", "fft_power"],
+            loss_weights=[1.0, 0.1],
+            target_keys=("a", "b", "c"),
+        )
+        self.assertIn("fft_power", out)
+        self.assertTrue(torch.isfinite(out["loss"]))
 
     def test_compose_with_residual_terms(self) -> None:
         pred, target, mask = self._sample()

@@ -9,6 +9,7 @@ from src.models.input_prep import (
     prepare_footprint_input,
     prepare_hr_imaging_input,
     prepare_imaging_input,
+    prepare_redshift_input,
     prepare_spatial_input,
     prepare_spectrum_input,
     prepare_targets_and_masks,
@@ -29,6 +30,7 @@ __all__ = [
     "prepare_footprint_input",
     "prepare_hr_imaging_input",
     "prepare_imaging_input",
+    "prepare_redshift_input",
     "prepare_spatial_input",
     "prepare_spectrum_input",
     "prepare_targets_and_masks",
@@ -93,6 +95,7 @@ class MapGenerator(nn.Module):
         x_hr = prepare_hr_imaging_input(batch, self.config)
         footprint = prepare_footprint_input(batch, self.config)
         spec = prepare_spectrum_input(batch, self.config)
+        redshift = prepare_redshift_input(batch, self.config)
         targets, masks = prepare_targets_and_masks(batch, self.config)
 
         detail_mult = effective_detail_scale_multiplier(self.config, epoch)
@@ -101,6 +104,7 @@ class MapGenerator(nn.Module):
             spectrum=spec,
             footprint=footprint,
             x_hr=x_hr,
+            redshift=redshift,
             detail_scale_multiplier=detail_mult,
         )
         # Losses in fp32 — avoids AMP overflow (especially integration / grad terms).

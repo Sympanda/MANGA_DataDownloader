@@ -45,12 +45,36 @@ class MapScoreResBlock(nn.Module):
         return h
 
 
+class SelfAttention2d(nn.Module):
+    """Lightweight multi-head self-attention over H×W (for bottleneck only)."""
+
+    def __init__(self, channels: int, *, num_heads: int = 4) -> None:
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
+        self.num_heads = int(num_heads)
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        h_norm = self.norm(x)
+        qkv = self.qkv(h_norm).reshape(b, 3, self.num_heads, c // self.num_heads, h * w)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        scale = (c // self.num_heads) ** -0.5
+        attn = torch.softmax(torch.einsum("bhcn,bhcm->bhnm", q, k) * scale, dim=-1)
+        out = torch.einsum("bhnm,bhcm->bhcn", attn, v).reshape(b, c, h, w)
+        return x + self.proj(out)
+
+
 class CondMapScoreUNet(nn.Module):
     """
     Pixel-space epsilon predictor for full Hα maps.
 
     Spatial conditioning is channel-concatenated with the noisy map.
     Spectrum conditioning is injected via FiLM into residual blocks.
+    Optional self-attention is applied only at the bottleneck.
     """
 
     def __init__(
@@ -67,12 +91,15 @@ class CondMapScoreUNet(nn.Module):
         spectrum_in_channels: int = 1,
         spectrum_pooling: str = "attention",
         cond_dim: int = 128,
+        use_bottleneck_attn: bool = False,
+        attn_heads: int = 4,
     ) -> None:
         super().__init__()
         self.map_channels = map_channels
         self.cond_channels = cond_channels
         self.use_spectrum = use_spectrum
         self.emb_dim = emb_dim
+        self.use_bottleneck_attn = bool(use_bottleneck_attn)
         in_ch = map_channels + cond_channels
 
         self.time_mlp = nn.Sequential(
@@ -109,6 +136,11 @@ class CondMapScoreUNet(nn.Module):
                 self.downsamples.append(nn.Identity())
 
         self.mid1 = MapScoreResBlock(ch, ch, emb_dim, cond_dim=film_dim)
+        self.mid_attn: SelfAttention2d | None
+        if self.use_bottleneck_attn:
+            self.mid_attn = SelfAttention2d(ch, num_heads=attn_heads)
+        else:
+            self.mid_attn = None
         self.mid2 = MapScoreResBlock(ch, ch, emb_dim, cond_dim=film_dim)
 
         self.up_blocks = nn.ModuleList()
@@ -165,6 +197,8 @@ class CondMapScoreUNet(nn.Module):
             h = self.downsamples[level](h)
 
         h = self.mid1(h, emb, spec_cond)
+        if self.mid_attn is not None:
+            h = self.mid_attn(h)
         h = self.mid2(h, emb, spec_cond)
 
         bi = 0
@@ -267,6 +301,7 @@ class MapDiffusionSchedule:
         x_init: torch.Tensor | None = None,
         t_start: int | None = None,
         spectrum: torch.Tensor | None = None,
+        x0_clip: tuple[float, float] | None = (-10.0, 10.0),
     ) -> torch.Tensor:
         """
         DDIM reverse process over the footprint domain.
@@ -274,6 +309,9 @@ class MapDiffusionSchedule:
         - ``x_init is None`` → start from N(0,I) at T (direct generator).
         - ``x_init`` + ``t_start`` → SDEdit-style corrector start.
         Outside ``footprint_mask``, values are held at 0 (not label_mask).
+
+        ``x0_clip`` clamps the predicted clean map in **score space** each step
+        (prevents DDIM blow-ups that look like binary 0/1 after denorm+plot).
         """
         device = cond.device
         b = cond.shape[0]
@@ -316,6 +354,8 @@ class MapDiffusionSchedule:
             eps = model(x, t, cond, spectrum=spectrum)
             a_t = alphas_cumprod[t].view(-1, 1, 1, 1)
             x0 = (x - torch.sqrt(1.0 - a_t) * eps) / torch.sqrt(a_t).clamp_min(1e-8)
+            if x0_clip is not None:
+                x0 = x0.clamp(float(x0_clip[0]), float(x0_clip[1]))
             if fp is not None:
                 x0 = x0 * fp
             if i == len(step_ids) - 1:
@@ -339,6 +379,90 @@ class MapDiffusionSchedule:
         if fp is not None:
             x = x * fp
         return x
+
+    @torch.no_grad()
+    def ddim_inpaint(
+        self,
+        model: CondMapScoreUNet,
+        cond: torch.Tensor,
+        *,
+        y0: torch.Tensor,
+        known_mask: torch.Tensor,
+        steps: int = 50,
+        eta: float = 0.0,
+        generator: torch.Generator | None = None,
+        footprint_mask: torch.Tensor | None = None,
+        spectrum: torch.Tensor | None = None,
+        x0_clip: tuple[float, float] | None = (-10.0, 10.0),
+    ) -> torch.Tensor:
+        """
+        RePaint-style DDIM: free pixels follow the model; known pixels are
+        re-injected from ``q(y0, t)`` every reverse step (score-space ``y0``).
+        """
+        device = cond.device
+        b = cond.shape[0]
+        h, w = cond.shape[-2], cond.shape[-1]
+        if footprint_mask is not None:
+            if footprint_mask.ndim == 3:
+                footprint_mask = footprint_mask.unsqueeze(1)
+            fp = (footprint_mask > 0).to(dtype=cond.dtype)
+        else:
+            fp = torch.ones((b, 1, h, w), device=device, dtype=cond.dtype)
+        if known_mask.ndim == 3:
+            known_mask = known_mask.unsqueeze(1)
+        known = ((known_mask > 0) & (fp > 0)).to(dtype=cond.dtype)
+        free = (fp > 0).to(dtype=cond.dtype) * (1.0 - known)
+
+        t0 = self.n_steps - 1
+        x = torch.randn(
+            (b, model.map_channels, h, w),
+            device=device,
+            generator=generator,
+        )
+        # Initialise known region at the noised truth for t0.
+        t_tensor = torch.full((b,), t0, device=device, dtype=torch.long)
+        x_known0, _ = self.q_sample(y0, t_tensor, noise=torch.randn_like(y0))
+        x = known * x_known0 + free * x
+        x = x * fp
+
+        step_ids = torch.linspace(t0, 0, steps, device=device).long().unique_consecutive()
+        alphas_cumprod = self.register["alphas_cumprod"]
+
+        for i, t_val in enumerate(step_ids):
+            t = torch.full((b,), int(t_val.item()), device=device, dtype=torch.long)
+            eps = model(x, t, cond, spectrum=spectrum)
+            a_t = alphas_cumprod[t].view(-1, 1, 1, 1)
+            x0 = (x - torch.sqrt(1.0 - a_t) * eps) / torch.sqrt(a_t).clamp_min(1e-8)
+            if x0_clip is not None:
+                x0 = x0.clamp(float(x0_clip[0]), float(x0_clip[1]))
+            x0 = x0 * fp
+
+            if i == len(step_ids) - 1:
+                # Final: hard paste known truth; free from model x0.
+                x = known * y0 + free * x0
+                break
+
+            t_prev = int(step_ids[i + 1].item())
+            a_prev = alphas_cumprod[t_prev].view(1, 1, 1, 1).to(dtype=a_t.dtype, device=device)
+            sigma = (
+                eta
+                * torch.sqrt((1 - a_prev) / (1 - a_t).clamp_min(1e-8))
+                * torch.sqrt((1 - a_t / a_prev.clamp_min(1e-8)).clamp_min(0.0))
+            )
+            dir_xt = torch.sqrt((1.0 - a_prev - sigma**2).clamp_min(0.0)) * eps
+            if eta > 0:
+                noise = torch.randn(x.shape, device=device, generator=generator)
+            else:
+                noise = torch.zeros_like(x)
+            x_u = torch.sqrt(a_prev) * x0 + dir_xt + sigma * noise
+
+            # RePaint: resample known pixels from q(y0, t_prev).
+            t_prev_b = torch.full((b,), t_prev, device=device, dtype=torch.long)
+            x_k, _ = self.q_sample(y0, t_prev_b, noise=torch.randn_like(y0))
+            x = known * x_k + free * x_u
+            x = x * fp
+
+        return x * fp
 
 
 class EMA:

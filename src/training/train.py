@@ -219,6 +219,8 @@ class Trainer:
                 if self.cfg.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                 self.optimizer.step()
+            # Score / diffusion models: keep EMA shadows in sync after every step
+            # (both AMP and non-AMP paths).
             if hasattr(self.model, "update_ema"):
                 self.model.update_ema()  # type: ignore[operator]
         else:
@@ -439,6 +441,8 @@ def run_training(
             if getattr(model, "uses_score_sample_eval", False):
                 eval_kwargs["n_samples"] = int(getattr(model, "n_samples", 4))
                 eval_kwargs["ddim_steps"] = int(getattr(model, "ddim_steps", 50))
+                # Live denoiser until EMA is verified trustworthy.
+                eval_kwargs["use_ema"] = False
                 if getattr(model, "mode", None) == "corrector":
                     eval_kwargs["t_start_frac"] = float(getattr(model, "t_start_frac", 0.25))
                 else:

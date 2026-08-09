@@ -17,7 +17,6 @@ from pathlib import Path
 
 import numpy as np
 from astropy.wcs import WCS
-from reproject import reproject_interp
 
 from manga_prep.targets.pipe3d_maps import DEFAULT_TARGET_SIZE
 from manga_prep.io.fits_io import celestial_wcs_from_header, open_fits
@@ -195,6 +194,8 @@ def reproject_cutout_to_amara_grid(
         native_shape=native_shape,
         oversample=oversample,
     )
+    from reproject import reproject_interp
+
     reprojected, _ = reproject_interp(
         (data, input_wcs),
         output_wcs,
@@ -238,6 +239,8 @@ def reproject_cutout_to_sdss_native_grid(
         target_shape=target_shape,
         native_shape=native_shape,
     )
+    from reproject import reproject_interp
+
     reprojected, _ = reproject_interp(
         (data, input_wcs),
         output_wcs,

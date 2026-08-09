@@ -1,0 +1,211 @@
+{
+  // =============================================================================
+  // MaNGA physical-property map prediction (amara_phys_maps.npz)
+  // Run:  python runner.py --config config_phys.jsonc --run-name phys_v1 --autoinc
+  // =============================================================================
+
+  "training": {
+    "device": "cuda:1",
+    "seed": 42,
+    "epochs": 200,
+    "mixed_precision": true,
+    "grad_clip": 1.0,
+
+    "optimizer": {
+      "lr": 3e-3,
+      "weight_decay": 1e-4
+    },
+
+    "lr_schedule": {
+      "name": "warmup_cosine",
+      "warmup_epochs": 10,
+      "min_lr_ratio": 0.001
+    },
+
+    "batching": {
+      // Level-0 local HR xattn is VRAM-heavy; keep eval ≤ train.
+      "train_batch_size": 16,
+      "eval_batch_size": 16,
+      "num_workers": 4
+    },
+
+    "early_stopping": {
+      "patience": 30,
+      "start_epoch": 50
+    },
+
+    "logging": {
+      "root_dir": "runs/manga_phys_maps",
+      "save_every_epochs": 5,
+      "write_plots": true,
+      "write_csv_history": true,
+      "save_config_snapshot": true,
+      "eval_max_plot": 8,
+      "eval_splits": ["val", "test"],
+      "run_post_train_eval": true
+    }
+  },
+
+  "data": {
+    "data_root": "manga_sdss_fits",
+    "use_sdss": true,
+    "use_legacy": false,
+    "use_spectrum": true,
+    "use_footprint_mask": true,
+
+    // Physical-property maps (does not touch legacy amara_maps.npz).
+    "target_source": "phys",
+    // Starter channel set — edit freely (direct + derived keys allowed).
+    "target_keys": [
+      "mw_age",
+      "mw_metallicity",
+      "stellar_mass_density",
+      "stellar_av",
+      "d4000",
+      "ha_ew"
+    ],
+    // Spaxel S/N floor on loss masks (null = footprint ∩ valid only).
+    // Tip: SNR≥3 is fine for line fluxes, but often wipes mw_age / metallicity / ha_ew.
+    // Start null, then raise per experiment (or drop sparse channels from target_keys).
+    "min_snr": null,
+    // Galaxy-level SF filter from pipe3d_global_flags.csv (null = all galaxies).
+    // Options: "global_bpt_sf" | "global_bpt_sf_strict" | "global_sf_ew_strict"
+    "galaxy_sf_flag": "global_bpt_sf",
+    // Also restrict loss to BPT star-forming spaxels (needs --include-derived export).
+    "require_sf_spaxel": false,
+    // Coverage-aware selection: fill fraction first (fair to small IFUs), then
+    // a soft mean-valid-pixel floor. Cached under manga_sdss_fits/stats/.
+    "min_footprint_fill": 0.80,
+    "min_valid_pixels": 50,
+
+    // Imaging grid for the UNet++ backbone (always WCS-aligned in the dataloader):
+    //   "aligned" → Amara FoV / orientation at 76×76 (sdss_aligned.npz)
+    //   "native"  → SDSS plate scale on ~196×196 as the *backbone* (legacy HR pipelines)
+    // With use_hr_cross_attn, backbone is forced to "aligned"; HR uses sdss_aligned_native.npz.
+    "imaging_resolution": "aligned",
+
+    "spectrum_mode": "fake",
+    "spectrum_fallback": true,
+    "require_all": true,
+
+    "augmentation": {
+      "enabled": true,
+      "hflip": true,
+      "vflip": true,
+      "rot90": true,
+      "p": 0.5
+    },
+
+    "split": {
+      "split_csv_path": "manga_sdss_fits/splits/default_split.csv",
+      "seed": 42,
+      "train_frac": 0.8,
+      "val_frac": 0.1,
+      "test_frac": 0.1
+    }
+  },
+
+  "model": {
+    "architecture": "unetpp",
+    "output_head": "single",
+
+    // Must match data.target_keys (runner also accepts keys here).
+    "target_keys": [
+      "mw_age",
+      "mw_metallicity",
+      "stellar_mass_density",
+      "stellar_av",
+      "d4000",
+      "ha_ew"
+    ],
+
+    // --- Spatial pipeline ---
+    // Backbone: aligned 76×76 ugriz → UNet++ → 76×76 maps
+    // Spectrum: FiLM (global)
+    // HR: optional cross-attention morphology stream (not resize+concat)
+    "imaging_resolution": "aligned",
+    "spatial_pipeline": "symmetric",
+    "footprint_mode": "spatial_channel",
+    "target_spatial_size": 76,
+    "hr_project_mode": "bilinear",
+
+    // High-res morphology via local cross-attention (ablation: set false).
+    "use_hr_cross_attention": true,
+    "hr_survey": "sdss",
+    "hr_cross_attention_levels": [0, 1],
+    "hr_attention_mode": "local",
+    "hr_attention_window": 7,
+    "hr_encoder_n_down": 1,
+    "hr_attn_heads": 4,
+    "hr_attn_dropout": 0.0,
+
+    "imaging_clamp_min": null,
+    "imaging_clamp_max": null,
+
+    "input_norm": {
+      "mode": "asinh",
+      "scales_path": "manga_sdss_fits/stats/input_asinh_scales.json",
+      "auto_compute": true,
+      "imaging_percentile": 99,
+      "spectrum_percentile": 99
+    },
+
+    "base_channels": 64,
+    "bottleneck_multiplier": 16,
+    "n_down": 4,
+    "dropout": 0.0,
+    "upsample_mode": "transpose",
+    "norm": "gn",
+    "residual_blocks": true,
+
+    "cond_dim": 64,
+    "film_injection": "encoder",
+    // FiLM on DRPall redshift from amara_phys_maps_metadata.json (log1p(z)).
+    "use_redshift_cond": true,
+
+    "spectrum_pooling": "attention",
+    "spectrum_use_wavelength": true,
+    "spectrum_use_ivar": true,
+    "spectrum_wave_min": 3622.0,
+    "spectrum_wave_max": 10354.0,
+
+    "deep_supervision": true,
+    "deep_supervision_weights": [0.05, 0.10, 0.15],
+    "deep_supervision_loss": "l1",
+
+    "coarse_factor": 2,
+    "detail_scale_init": 1.0,
+
+    // Retune vs emission-line runs: keep L1 primary; soften grad/lap so they
+    // don't overpower fine structure; add FFT power to fight over-smooth preds.
+    "losses": [
+      "charbonnier",
+      "l1",
+      "mse",
+      "grad",
+      "laplacian",
+      "fft_power",
+      "integration",
+      "tv_pred",
+      "residual_amp",
+      "residual_tv"
+    ],
+    "loss_weights": [
+      1.0,   // charbonnier
+      0.0,   // l1
+      0.0,   // mse
+      0.25,  // grad (was 0.4)
+      0.08,  // laplacian (was 0.18)
+      0.15,  // fft_power
+      0.0,   // integration
+      0.0,   // tv_pred
+      0.0,   // residual_amp
+      0.0    // residual_tv
+    ],
+    "loss_params": {
+      "charbonnier": { "eps": 1e-3 },
+      "fft_power": { "eps": 1e-8 },
+      "integration": { "normalize": "mean" }
+    }
+  }
+}

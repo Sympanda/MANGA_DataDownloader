@@ -1,0 +1,10 @@
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
+.venv/
+*.pyc
+collaborator_pipe3d_maps/
+pipe3d_maps/
+manga_sdss_fits/
+*.fits
+*.fits.gz

@@ -263,12 +263,45 @@ def masked_gaussian_nll(
     return _masked_mean(nll, mask)
 
 
+def masked_fft_power_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Match 2D log power spectra after zeroing invalid pixels.
+
+    Encourages high-frequency spatial power that pure L1 tends to wash out.
+    Each (batch, channel) map with ≥1 valid pixel contributes equally.
+    """
+    mask = _ensure_bchw(loss_mask, pred)
+    tgt = _safe_target(target, mask)
+    m = (mask > 0).to(dtype=pred.dtype)
+    pred_m = pred * m
+    tgt_m = tgt * m
+
+    fp = torch.fft.rfft2(pred_m)
+    ft = torch.fft.rfft2(tgt_m)
+    pp = (fp.real.square() + fp.imag.square()).clamp_min(eps)
+    pt = (ft.real.square() + ft.imag.square()).clamp_min(eps)
+    err = (pp.log() - pt.log()).abs()
+    # Mean over frequency bins per map, then equal average over active maps.
+    per_map = err.mean(dim=(-2, -1))
+    active = m.sum(dim=(-2, -1)) > 0
+    if not bool(active.any()):
+        return pred.new_tensor(0.0)
+    return per_map[active].mean()
+
+
 LOSS_REGISTRY: dict[str, Callable] = {
     "charbonnier": masked_charbonnier,
     "l1": masked_l1,
     "mse": masked_mse,
     "grad": masked_pairwise_grad_loss,
     "laplacian": masked_laplacian_loss,
+    "fft_power": masked_fft_power_loss,
     "tv_pred": prediction_tv_loss,
     "residual_amp": residual_amplitude_loss,
     "residual_tv": residual_tv_loss,

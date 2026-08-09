@@ -97,6 +97,9 @@ python scripts/hr_zero_contribution.py --run-name model_d_hr_xattn --split val
 
 # Can the model overfit ~32 galaxies? (capacity / label check; HR forced off)
 python scripts/overfit_tiny.py --config config.jsonc --n-galaxies 32 --run-name overfit_32 --autoinc
+
+# Same check on physical-property maps (detail / capacity)
+python scripts/overfit_tiny.py --config config_phys_overfit.jsonc --n-galaxies 16 --run-name phys_overfit_16 --autoinc
 ```
 
 ```powershell

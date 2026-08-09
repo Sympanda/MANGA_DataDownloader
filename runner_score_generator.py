@@ -44,6 +44,11 @@ def _build_score_model(user_cfg: dict, *, score_norm, force_mode: str = "generat
     model_cfg.n_target_maps = len(model_cfg.target_keys)
 
     mults = tuple(int(x) for x in score_top.get("channel_mults", [1, 2, 4, 4]))
+    # Legacy checkpoints trained with label_mask in cond; default False for new runs.
+    if "condition_on_label_mask" in score_top:
+        cond_label = bool(score_top["condition_on_label_mask"])
+    else:
+        cond_label = True  # backward-compatible load of older runs
     model = MapScoreModel.build(
         model_cfg,
         mode=force_mode,  # type: ignore[arg-type]
@@ -61,6 +66,12 @@ def _build_score_model(user_cfg: dict, *, score_norm, force_mode: str = "generat
         ema_decay=float(score_top.get("ema_decay", 0.9999)),
         t_start_frac=float(score_top.get("t_start_frac", 0.25)),
         receive_base_as_cond=(force_mode == "corrector"),
+        condition_on_label_mask=cond_label,
+        unconditional=bool(score_top.get("unconditional", False)),
+        use_min_snr=bool(score_top.get("use_min_snr", False)),
+        min_snr_gamma=float(score_top.get("min_snr_gamma", 5.0)),
+        use_bottleneck_attn=bool(score_top.get("use_bottleneck_attn", False)),
+        attn_heads=int(score_top.get("attn_heads", 4)),
     )
     raw_fracs = score_top.get("eval_t_start_fracs")
     if raw_fracs is not None:
@@ -138,6 +149,7 @@ def _run_eval_only(args: argparse.Namespace) -> int:
         max_coverage_pct=cov_max,
         feature=feature,
         use_stratified_weights=False,
+        plateifu_allowlist=score_top.get("overfit_plateifus"),
     )
     print(
         f"Eval coverage band: [{cov_min:g}, "
@@ -183,12 +195,14 @@ def _run_eval_only(args: argparse.Namespace) -> int:
         if len(split_loaders[split]) == 0:
             print(f"  {split}: empty loader for this coverage band; skip")
             continue
+        use_ema = not bool(getattr(args, "no_ema", False))
+        ema_tag = "ema" if use_ema else "noema"
         rows = evaluate_score_samples(
             model,
             split_loaders[split],
             device=device,
             map_keys=tuple(model.config.target_keys),
-            plots_dir=plots_dir,
+            plots_dir=plots_dir / ema_tag,
             split=split,
             max_plot=max_plot,
             max_galaxies=max_galaxies,
@@ -196,15 +210,16 @@ def _run_eval_only(args: argparse.Namespace) -> int:
             ddim_steps=int(score_top.get("ddim_steps", 50)),
             t_start_fracs=t_fracs,
             seed=train_cfg.seed,
+            use_ema=use_ema,
         )
-        csv_path = run_dir / "csv" / f"{split}_metrics_{band_tag}.csv"
+        csv_path = run_dir / "csv" / f"{split}_metrics_{band_tag}_{ema_tag}.csv"
         write_metrics_csv(rows, csv_path)
         mse_vals = [float(r["mse_all"]) for r in rows if np.isfinite(float(r["mse_all"]))]
         print(
-            f"  {split} n={len(rows)} mean mse_all={float(np.mean(mse_vals)):.6f} "
-            f"-> {csv_path}"
+            f"  {split} n={len(rows)} use_ema={use_ema} mean mse_all="
+            f"{float(np.mean(mse_vals)):.6f} -> {csv_path}"
         )
-        print(f"  panels ({t_fracs}, max_plot={max_plot}) -> {plots_dir}")
+        print(f"  panels ({t_fracs}, max_plot={max_plot}) -> {plots_dir / ema_tag}")
     return 0
 
 
@@ -258,6 +273,11 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default=None,
         help="Comma-separated splits to eval, e.g. val,test",
+    )
+    parser.add_argument(
+        "--no-ema",
+        action="store_true",
+        help="Sample with live denoiser weights (skip EMA). Diagnostic for EMA bugs.",
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)

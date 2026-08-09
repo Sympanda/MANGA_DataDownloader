@@ -220,6 +220,7 @@ def evaluate_map_predictions(
         prepare_footprint_input,
         prepare_hr_imaging_input,
         prepare_imaging_input,
+        prepare_redshift_input,
         prepare_spectrum_input,
         prepare_targets_and_masks,
     )
@@ -240,11 +241,20 @@ def evaluate_map_predictions(
         spec = prepare_spectrum_input(batch, model.config)
         if spec is not None:
             spec = spec.to(device)
+        redshift = prepare_redshift_input(batch, model.config)
+        if redshift is not None:
+            redshift = redshift.to(device)
         targets, masks = prepare_targets_and_masks(batch, model.config)
         targets = targets.to(device)
         masks = masks.to(device)
 
-        pred, _aux = model.model(x, spectrum_flux=spec, footprint=footprint, x_hr=x_hr)
+        pred, _aux = model.model(
+            x,
+            spectrum_flux=spec,
+            footprint=footprint,
+            x_hr=x_hr,
+            redshift=redshift,
+        )
 
         for i, plateifu in enumerate(plateifus):
             per_map_mse = []

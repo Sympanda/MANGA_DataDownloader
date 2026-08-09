@@ -33,14 +33,18 @@ def make_score_dataloaders(
     max_coverage_pct: float | None = None,
     feature: str = "ha_flux",
     use_stratified_weights: bool = True,
+    plateifu_allowlist: list[str] | set[str] | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader, DataLoader, list[str]]:
     """
     Build loaders with:
     - train: train-split ∩ coverage band (+ optional stratified weights)
     - val/test: original val/test ∩ coverage band (no reweighting)
+
+    ``plateifu_allowlist`` further restricts all splits (overfit diagnostics).
     """
     base = build_base_dataset(data_cfg)
     split_path = data_cfg.split_csv_path
+    allow = None if plateifu_allowlist is None else set(plateifu_allowlist)
 
     train_ids = select_score_plateifus(
         coverage_csv=coverage_csv,
@@ -66,6 +70,10 @@ def make_score_dataloaders(
         min_coverage_pct=min_coverage_pct,
         max_coverage_pct=max_coverage_pct,
     )
+    if allow is not None:
+        train_ids = [p for p in train_ids if p in allow]
+        val_ids = [p for p in val_ids if p in allow]
+        test_ids = [p for p in test_ids if p in allow]
 
     train_aug = AugmentConfig(
         enabled=data_cfg.augmentation.enabled,
@@ -82,9 +90,17 @@ def make_score_dataloaders(
     ds_train_eval = MangaSplitDataset(base, split="train", split_csv_path=split_path, augment=no_aug)
 
     filter_dataset_plateifus(ds_train, set(train_ids))
-    filter_dataset_plateifus(ds_val, set(val_ids))
-    filter_dataset_plateifus(ds_test, set(test_ids))
     filter_dataset_plateifus(ds_train_eval, set(train_ids))
+    # Train-only allowlists (overfit) do not intersect the val/test splits; mirror
+    # the train-eval rows so loaders stay non-empty.
+    if val_ids:
+        filter_dataset_plateifus(ds_val, set(val_ids))
+    else:
+        ds_val.rows = list(ds_train_eval.rows)
+    if test_ids:
+        filter_dataset_plateifus(ds_test, set(test_ids))
+    else:
+        ds_test.rows = list(ds_train_eval.rows)
 
     train_bs = int(batching_cfg.get("train_batch_size", 8))
     eval_bs = int(batching_cfg.get("eval_batch_size", 8))
@@ -124,18 +140,15 @@ def compute_score_norm_stats(
     *,
     max_batches: int | None = None,
 ) -> ScoreNormStats:
-    """Mean/std of scaled target maps inside footprint, over the score-train loader."""
+    """Mean/std of scaled targets on **valid label pixels only** (not footprint fill)."""
     total = 0.0
     total_sq = 0.0
     n = 0
     for i, batch in enumerate(dataloader):
         if max_batches is not None and i >= max_batches:
             break
-        targets, _ = prepare_targets_and_masks(batch, model_cfg)
-        fp = batch["footprint_mask"].float()
-        if fp.ndim == 3:
-            fp = fp.unsqueeze(1)
-        m = fp > 0
+        targets, label_mask = prepare_targets_and_masks(batch, model_cfg)
+        m = label_mask > 0
         vals = targets[m]
         if vals.numel() == 0:
             continue
@@ -143,7 +156,7 @@ def compute_score_norm_stats(
         total_sq += float((vals**2).sum().item())
         n += int(vals.numel())
     if n == 0:
-        raise RuntimeError("No footprint pixels found while computing score normalisation")
+        raise RuntimeError("No labelled pixels found while computing score normalisation")
     mean = total / n
     var = max(total_sq / n - mean * mean, 1e-12)
     return ScoreNormStats(mean=mean, std=float(np.sqrt(var)))

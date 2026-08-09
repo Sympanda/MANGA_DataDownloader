@@ -357,6 +357,7 @@ def load_amara_training_targets(
     galaxy_dir,
     *,
     scaled: bool = True,
+    keys: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, object]:
     """
     Load UNet targets and masks from amara_maps.npz.
@@ -368,13 +369,17 @@ def load_amara_training_targets(
       footprint_mask: Pipe3D SELECT_REG padded to target canvas
       native_shape, target_shape
     """
+    if keys is None:
+        keys = AMARA_TARGET_KEYS
+    keys = tuple(keys)
+
     with load_amara_maps(galaxy_dir) as archive:
         arrays = {key: np.asarray(archive[key]) for key in archive.files}
 
     suffix = "_scaled" if scaled else "_raw"
-    targets = {key: arrays[f"{key}{suffix}"].astype(np.float32) for key in AMARA_TARGET_KEYS}
-    target_valid_masks = {key: arrays[f"{key}_valid_mask"].astype(np.uint8) for key in AMARA_TARGET_KEYS}
-    target_loss_masks = {key: _loss_mask_from_npz(arrays, key) for key in AMARA_TARGET_KEYS}
+    targets = {key: arrays[f"{key}{suffix}"].astype(np.float32) for key in keys}
+    target_valid_masks = {key: arrays[f"{key}_valid_mask"].astype(np.uint8) for key in keys}
+    target_loss_masks = {key: _loss_mask_from_npz(arrays, key) for key in keys}
 
     return {
         "targets": targets,

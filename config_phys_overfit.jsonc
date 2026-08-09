@@ -1,0 +1,194 @@
+{
+  // =============================================================================
+  // Phys-map overfit / capacity check (tiny train-only subset).
+  //
+  // Asks: can the UNet++ backbone memorise physical maps on N galaxies?
+  // If train L1 stays high, capacity/labels/losses may be limiting detail.
+  //
+  //   python scripts/overfit_tiny.py --config config_phys_overfit.jsonc \
+  //       --n-galaxies 16 --run-name phys_overfit_16 --autoinc
+  //
+  // Optional: --epochs 800 --batch-size 8 --device cuda:1
+  // HR cross-attn / aug / dropout are forced off by the script.
+  // =============================================================================
+
+  "training": {
+    "device": "cuda:1",
+    "seed": 42,
+    "epochs": 600,
+    "mixed_precision": true,
+    "grad_clip": 1.0,
+
+    "optimizer": {
+      "lr": 1e-3,
+      "weight_decay": 0.0
+    },
+
+    // Overridden to constant LR by overfit_tiny.py.
+    "lr_schedule": {
+      "name": "constant",
+      "warmup_epochs": 0,
+      "min_lr_ratio": 1.0
+    },
+
+    "batching": {
+      "train_batch_size": 8,
+      "eval_batch_size": 8,
+      "num_workers": 4
+    },
+
+    "early_stopping": {
+      "patience": 999999,
+      "start_epoch": 999999
+    },
+
+    "logging": {
+      "root_dir": "runs/manga_phys_overfit",
+      "save_every_epochs": 25,
+      "write_plots": true,
+      "write_csv_history": true,
+      "save_config_snapshot": true,
+      "eval_max_plot": 16,
+      "eval_splits": ["train"],
+      "run_post_train_eval": false
+    }
+  },
+
+  "data": {
+    "data_root": "manga_sdss_fits",
+    "use_sdss": true,
+    "use_legacy": false,
+    "use_spectrum": true,
+    "use_footprint_mask": true,
+
+    "target_source": "phys",
+    "target_keys": [
+      "mw_age",
+      "mw_metallicity",
+      "stellar_mass_density",
+      "stellar_av",
+      "d4000",
+      "ha_ew"
+    ],
+    // Keep null for overfit so we are not starved of supervised pixels.
+    "min_snr": null,
+    "galaxy_sf_flag": "global_bpt_sf",
+    "require_sf_spaxel": false,
+    // Soft floors only — overfit_tiny ranks by fill then mean valid pixels.
+    "min_footprint_fill": 0.85,
+    "min_valid_pixels": 40,
+
+    "imaging_resolution": "aligned",
+    "spectrum_mode": "fake",
+    "spectrum_fallback": true,
+    "require_all": true,
+
+    // Forced off by overfit_tiny.py anyway.
+    "augmentation": {
+      "enabled": false,
+      "hflip": true,
+      "vflip": true,
+      "rot90": true,
+      "p": 0.5
+    },
+
+    "split": {
+      "split_csv_path": "manga_sdss_fits/splits/default_split.csv",
+      "seed": 42,
+      "train_frac": 0.8,
+      "val_frac": 0.1,
+      "test_frac": 0.1
+    }
+  },
+
+  "model": {
+    "architecture": "unetpp",
+    "output_head": "single",
+
+    "target_keys": [
+      "mw_age",
+      "mw_metallicity",
+      "stellar_mass_density",
+      "stellar_av",
+      "d4000",
+      "ha_ew"
+    ],
+
+    "imaging_resolution": "aligned",
+    "spatial_pipeline": "symmetric",
+    "footprint_mode": "spatial_channel",
+    "target_spatial_size": 76,
+    "hr_project_mode": "bilinear",
+
+    // Forced off by overfit_tiny.py (backbone memorisation only).
+    "use_hr_cross_attention": false,
+
+    "imaging_clamp_min": null,
+    "imaging_clamp_max": null,
+
+    "input_norm": {
+      "mode": "asinh",
+      "scales_path": "manga_sdss_fits/stats/input_asinh_scales.json",
+      "auto_compute": true,
+      "imaging_percentile": 99,
+      "spectrum_percentile": 99
+    },
+
+    "base_channels": 64,
+    "bottleneck_multiplier": 16,
+    "n_down": 4,
+    "dropout": 0.0,
+    "upsample_mode": "transpose",
+    "norm": "gn",
+    "residual_blocks": true,
+
+    "cond_dim": 64,
+    "film_injection": "encoder",
+    "use_redshift_cond": true,
+
+    "spectrum_pooling": "attention",
+    "spectrum_use_wavelength": true,
+    "spectrum_use_ivar": true,
+    "spectrum_wave_min": 3622.0,
+    "spectrum_wave_max": 10354.0,
+
+    "deep_supervision": true,
+    "deep_supervision_weights": [0.05, 0.10, 0.15],
+    "deep_supervision_loss": "l1",
+
+    "coarse_factor": 2,
+    "detail_scale_init": 1.0,
+
+    // L1 + light structure losses: if this cannot overfit, capacity/labels
+    // are the issue. For a pure pixel-value memorisation check, set grad/lap to 0.
+    "losses": [
+      "charbonnier",
+      "l1",
+      "mse",
+      "grad",
+      "laplacian",
+      "fft_power",
+      "integration",
+      "tv_pred",
+      "residual_amp",
+      "residual_tv"
+    ],
+    "loss_weights": [
+      1.0,   // charbonnier
+      0.0,   // l1
+      0.0,   // mse
+      0.2,   // grad
+      0.05,  // laplacian
+      0.10,  // fft_power
+      0.0,   // integration
+      0.0,   // tv_pred
+      0.0,   // residual_amp
+      0.0    // residual_tv
+    ],
+    "loss_params": {
+      "charbonnier": { "eps": 1e-3 },
+      "fft_power": { "eps": 1e-8 },
+      "integration": { "normalize": "mean" }
+    }
+  }
+}

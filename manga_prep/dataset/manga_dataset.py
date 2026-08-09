@@ -14,6 +14,11 @@ import torch
 from torch.utils.data import Dataset
 
 from manga_prep.targets.pipe3d_maps import AMARA_TARGET_KEYS, load_amara_training_targets
+from manga_prep.targets.pipe3d_phys_maps import (
+    AMARA_PHYS_DERIVED_KEYS,
+    AMARA_PHYS_DIRECT_KEYS,
+    load_amara_phys_training_targets,
+)
 from manga_prep.io.fits_io import open_fits
 from manga_prep.io.aligned_cache import (
     ImagingGrid,
@@ -37,14 +42,25 @@ from manga_prep.dataset.index import (
     sdss_imaging_ready,
     write_manga_dataset_index,
 )
+from manga_prep.dataset.map_coverage import load_or_build_coverage_table
+from manga_prep.dataset.redshift import load_galaxy_redshift
 
 SpectrumMode = Literal["real", "fake"] | None
+TargetSource = Literal["amara", "phys"]
+GalaxySFFlag = Literal[
+    "global_bpt_sf",
+    "global_bpt_sf_strict",
+    "global_sf_ew_strict",
+]
 
 _SDSS_BANDS = ("u", "g", "r", "i", "z")
 _LEGACY_BANDS = ("g", "r", "i", "z")
 
 # Fixed canvas for SDSS-native aligned HR imaging (and debug raw stacks).
 NATIVE_IMAGING_CANVAS = SDSS_NATIVE_CANVAS
+
+ALLOWED_PHYS_TARGET_KEYS = frozenset(AMARA_PHYS_DIRECT_KEYS) | frozenset(AMARA_PHYS_DERIVED_KEYS)
+ALLOWED_AMARA_TARGET_KEYS = frozenset(AMARA_TARGET_KEYS)
 
 
 def _load_fits_image(path: Path) -> np.ndarray:
@@ -174,6 +190,27 @@ class MangaGalaxyDataset(Dataset):
         Keep only galaxies with every requested input/target available.
     target_scaled:
         If True (default), targets are Amara 0-1 scaled maps. If False, raw physical maps.
+    target_source:
+        "amara" → legacy emission-line ``amara_maps.npz``;
+        "phys" → physical-property ``amara_phys_maps.npz``.
+    target_keys:
+        Optional subset of map keys to load. Defaults to all keys for the source.
+    min_snr:
+        Spaxel S/N floor applied to phys loss masks (ignored for amara source).
+    galaxy_sf_flag:
+        Optional galaxy-level SF filter from the dataset index
+        (``global_bpt_sf``, ``global_bpt_sf_strict``, ``global_sf_ew_strict``).
+    require_sf_spaxel:
+        If True (phys only), intersect loss masks with ``is_sf_bpt_mask``.
+    min_footprint_fill:
+        Keep galaxies whose mean (valid / footprint) fill fraction is ≥ this
+        value (None = no fill filter). Prefer this over raw pixel count so
+        small IFUs are not punished.
+    min_valid_pixels:
+        Soft floor on mean supervised pixels across ``target_keys`` (None = off).
+    include_redshift / require_redshift:
+        Load DRPall redshift from phys-map metadata; optionally drop galaxies
+        without a positive finite z (required when FiLM-conditioning on z).
     """
 
     def __init__(
@@ -188,6 +225,15 @@ class MangaGalaxyDataset(Dataset):
         spectrum_fallback: bool = True,
         require_all: bool = True,
         target_scaled: bool = True,
+        target_source: TargetSource = "amara",
+        target_keys: tuple[str, ...] | list[str] | None = None,
+        min_snr: float | None = None,
+        galaxy_sf_flag: GalaxySFFlag | None = None,
+        require_sf_spaxel: bool = False,
+        min_footprint_fill: float | None = None,
+        min_valid_pixels: float | None = None,
+        include_redshift: bool = False,
+        require_redshift: bool = False,
         resample_spectrum: bool = True,
         spectrum_wave_grid: np.ndarray | None = None,
         align_imaging_to_amara_grid: bool = True,
@@ -207,6 +253,55 @@ class MangaGalaxyDataset(Dataset):
         self.spectrum_fallback = spectrum_fallback
         self.require_all = require_all
         self.target_scaled = target_scaled
+        self.target_source: TargetSource = target_source  # type: ignore[assignment]
+        if self.target_source not in ("amara", "phys"):
+            raise ValueError(f"target_source must be 'amara' or 'phys', got {target_source!r}")
+        self.min_snr = None if min_snr is None else float(min_snr)
+        self.galaxy_sf_flag = galaxy_sf_flag
+        if self.galaxy_sf_flag is not None and self.galaxy_sf_flag not in (
+            "global_bpt_sf",
+            "global_bpt_sf_strict",
+            "global_sf_ew_strict",
+        ):
+            raise ValueError(f"Unknown galaxy_sf_flag: {galaxy_sf_flag!r}")
+        self.require_sf_spaxel = bool(require_sf_spaxel)
+        if self.require_sf_spaxel and self.target_source != "phys":
+            raise ValueError("require_sf_spaxel requires target_source='phys'")
+        if self.min_snr is not None and self.target_source != "phys":
+            raise ValueError("min_snr requires target_source='phys'")
+        self.min_footprint_fill = (
+            None if min_footprint_fill is None else float(min_footprint_fill)
+        )
+        self.min_valid_pixels = (
+            None if min_valid_pixels is None else float(min_valid_pixels)
+        )
+        if self.min_footprint_fill is not None and not (0.0 <= self.min_footprint_fill <= 1.0):
+            raise ValueError(
+                f"min_footprint_fill must be in [0, 1], got {self.min_footprint_fill}"
+            )
+        self.include_redshift = bool(include_redshift)
+        self.require_redshift = bool(require_redshift)
+        if self.require_redshift and not self.include_redshift:
+            self.include_redshift = True
+
+        if target_keys is None:
+            self.target_keys = (
+                tuple(AMARA_PHYS_DIRECT_KEYS)
+                if self.target_source == "phys"
+                else tuple(AMARA_TARGET_KEYS)
+            )
+        else:
+            self.target_keys = tuple(str(k) for k in target_keys)
+        allowed = ALLOWED_PHYS_TARGET_KEYS if self.target_source == "phys" else ALLOWED_AMARA_TARGET_KEYS
+        unknown = [k for k in self.target_keys if k not in allowed]
+        if unknown:
+            raise ValueError(
+                f"Unknown target_keys for source={self.target_source!r}: {unknown}; "
+                f"allowed subset of {sorted(allowed)}"
+            )
+        if not self.target_keys:
+            raise ValueError("target_keys must be non-empty")
+
         self.resample_spectrum = resample_spectrum
         self.align_imaging_to_amara_grid = bool(align_imaging_to_amara_grid)
         self.prefer_aligned_cache = bool(prefer_aligned_cache)
@@ -261,7 +356,10 @@ class MangaGalaxyDataset(Dataset):
         if self.include_legacy_imaging:
             flags.append(("has_legacy_imaging", True))
         if self.include_targets:
-            flags.append(("has_amara_maps", True))
+            if self.target_source == "phys":
+                flags.append(("has_amara_phys_maps", True))
+            else:
+                flags.append(("has_amara_maps", True))
         if self.spectrum == "fake":
             flags.append(("has_fake_spectrum", True))
         elif self.spectrum == "real" and not self.spectrum_fallback:
@@ -273,9 +371,23 @@ class MangaGalaxyDataset(Dataset):
     def _filter_rows(self, rows: list[dict]) -> list[dict]:
         if self.require_all:
             flags = self._requested_flags()
-            filtered = [row for row in rows if all(row[flag] == required for flag, required in flags)]
+            filtered = []
+            for row in rows:
+                ok = True
+                for flag, required in flags:
+                    value = row.get(flag)
+                    if value is None and flag == "has_amara_phys_maps":
+                        value = False
+                    if value != required:
+                        ok = False
+                        break
+                if ok:
+                    filtered.append(row)
         else:
             filtered = rows
+
+        if self.galaxy_sf_flag is not None:
+            filtered = [row for row in filtered if bool(row.get(self.galaxy_sf_flag))]
 
         if self.include_sdss_imaging:
             filtered = [row for row in filtered if sdss_imaging_ready(self.data_root, row)]
@@ -286,6 +398,65 @@ class MangaGalaxyDataset(Dataset):
                 filtered = [row for row in filtered if sdss_imaging_ready(self.data_root, row)]
             else:
                 filtered = [row for row in filtered if legacy_imaging_ready(self.data_root, row)]
+
+        if self.min_footprint_fill is not None or self.min_valid_pixels is not None:
+            n_before = len(filtered)
+            print(
+                "Coverage pre-check: "
+                f"min_footprint_fill="
+                f"{'None' if self.min_footprint_fill is None else f'{self.min_footprint_fill:.0%}'}  "
+                f"min_valid_pixels="
+                f"{'None' if self.min_valid_pixels is None else self.min_valid_pixels}  "
+                f"(candidates={n_before:,})",
+                flush=True,
+            )
+            coverage = load_or_build_coverage_table(
+                self.data_root,
+                filtered,
+                target_source=self.target_source,
+                target_keys=self.target_keys,
+                min_snr=self.min_snr,
+                require_sf_spaxel=self.require_sf_spaxel,
+                progress=True,
+            )
+            kept = []
+            fills: list[float] = []
+            for row in filtered:
+                n_mean, _fp_n, fill = coverage.get(row["plateifu"], (0.0, 0, 0.0))
+                if self.min_footprint_fill is not None and fill < self.min_footprint_fill:
+                    continue
+                if self.min_valid_pixels is not None and n_mean < self.min_valid_pixels:
+                    continue
+                kept.append(row)
+                fills.append(fill)
+            filtered = kept
+            fill_note = ""
+            if fills:
+                fill_note = (
+                    f"  kept fill: min={min(fills):.1%} median="
+                    f"{float(np.median(fills)):.1%} max={max(fills):.1%}"
+                )
+            print(
+                f"Coverage pre-check: kept {len(filtered):,}/{n_before:,} galaxies"
+                f"{fill_note}",
+                flush=True,
+            )
+
+        if self.require_redshift:
+            n_before = len(filtered)
+            kept = []
+            for row in filtered:
+                z = load_galaxy_redshift(self.data_root / row["galaxy_dir"])
+                if z is not None:
+                    kept.append(row)
+            filtered = kept
+            if n_before != len(filtered):
+                print(
+                    f"Redshift pre-check: kept {len(filtered):,}/{n_before:,} galaxies "
+                    f"with positive z",
+                    flush=True,
+                )
+
         return filtered
 
     def __len__(self) -> int:
@@ -295,8 +466,13 @@ class MangaGalaxyDataset(Dataset):
         return self.data_root / row["galaxy_dir"]
 
     def _target_shape(self, row: dict) -> tuple[int, int]:
-        if row.get("amara_maps_npz"):
-            with np.load(self.data_root / row["amara_maps_npz"]) as archive:
+        npz_rel = None
+        if self.target_source == "phys":
+            npz_rel = row.get("amara_phys_maps_npz")
+        else:
+            npz_rel = row.get("amara_maps_npz")
+        if npz_rel:
+            with np.load(self.data_root / npz_rel) as archive:
                 return tuple(int(x) for x in archive["target_shape"])
         from manga_prep.targets.pipe3d_maps import DEFAULT_TARGET_SIZE
 
@@ -511,6 +687,11 @@ class MangaGalaxyDataset(Dataset):
             sample["ra_deg"] = float(row["ra_deg"])
         if row.get("dec_deg"):
             sample["dec_deg"] = float(row["dec_deg"])
+        if self.include_redshift:
+            z = load_galaxy_redshift(self._galaxy_dir(row))
+            if z is None and self.require_redshift:
+                raise KeyError(f"Missing redshift for {row['plateifu']}")
+            sample["redshift"] = float("nan") if z is None else float(z)
 
         inputs: dict[str, object] = {}
         if self.include_sdss_imaging:
@@ -525,16 +706,30 @@ class MangaGalaxyDataset(Dataset):
             sample["inputs"] = inputs
 
         if self.include_targets:
-            target_bundle = load_amara_training_targets(
-                self._galaxy_dir(row),
-                scaled=self.target_scaled,
-            )
+            if self.target_source == "phys":
+                target_bundle = load_amara_phys_training_targets(
+                    self._galaxy_dir(row),
+                    keys=self.target_keys,
+                    scaled=self.target_scaled,
+                    snr_min=self.min_snr,
+                    require_sf_spaxel=self.require_sf_spaxel,
+                )
+            else:
+                target_bundle = load_amara_training_targets(
+                    self._galaxy_dir(row),
+                    scaled=self.target_scaled,
+                    keys=self.target_keys,
+                )
             sample["targets"] = target_bundle["targets"]
             sample["target_valid_masks"] = target_bundle["target_valid_masks"]
             sample["target_loss_masks"] = target_bundle["target_loss_masks"]
             sample["footprint_mask"] = target_bundle["footprint_mask"]
             sample["native_shape"] = target_bundle["native_shape"]
             sample["target_shape"] = target_bundle["target_shape"]
+            if "is_sf_bpt_mask" in target_bundle:
+                sample["is_sf_bpt_mask"] = target_bundle["is_sf_bpt_mask"]
+            if "bpt_class_code_mask" in target_bundle:
+                sample["bpt_class_code_mask"] = target_bundle["bpt_class_code_mask"]
 
         return sample
 
@@ -567,6 +762,11 @@ def collate_manga_batch(batch: list[dict[str, object]]) -> dict[str, object]:
         out["ra_deg"] = torch.tensor([item["ra_deg"] for item in batch], dtype=torch.float64)
     if "dec_deg" in batch[0]:
         out["dec_deg"] = torch.tensor([item["dec_deg"] for item in batch], dtype=torch.float64)
+    if "redshift" in batch[0]:
+        out["redshift"] = torch.tensor(
+            [float(item["redshift"]) for item in batch],  # type: ignore[arg-type]
+            dtype=torch.float32,
+        )
 
     if "inputs" in batch[0]:
         inputs: dict[str, object] = {}
@@ -601,26 +801,35 @@ def collate_manga_batch(batch: list[dict[str, object]]) -> dict[str, object]:
         out["inputs"] = inputs
 
     if "targets" in batch[0]:
+        target_keys = tuple(batch[0]["targets"].keys())
         out["targets"] = {
             key: torch.from_numpy(
                 np.stack([item["targets"][key] for item in batch], axis=0)
             )
-            for key in AMARA_TARGET_KEYS
+            for key in target_keys
         }
         out["target_valid_masks"] = {
             key: torch.from_numpy(
                 np.stack([item["target_valid_masks"][key] for item in batch], axis=0)
             )
-            for key in AMARA_TARGET_KEYS
+            for key in target_keys
         }
         out["target_loss_masks"] = {
             key: torch.from_numpy(
                 np.stack([item["target_loss_masks"][key] for item in batch], axis=0)
             )
-            for key in AMARA_TARGET_KEYS
+            for key in target_keys
         }
         out["footprint_mask"] = torch.from_numpy(
             np.stack([item["footprint_mask"] for item in batch], axis=0)
         )
+        if "is_sf_bpt_mask" in batch[0]:
+            out["is_sf_bpt_mask"] = torch.from_numpy(
+                np.stack([item["is_sf_bpt_mask"] for item in batch], axis=0)
+            )
+        if "bpt_class_code_mask" in batch[0]:
+            out["bpt_class_code_mask"] = torch.from_numpy(
+                np.stack([item["bpt_class_code_mask"] for item in batch], axis=0)
+            )
 
     return out

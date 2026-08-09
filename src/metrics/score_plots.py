@@ -61,6 +61,7 @@ def evaluate_score_samples(
     seed: int = 0,
     show_n_individual: int = 4,
     max_galaxies: int | None = None,
+    use_ema: bool = False,
 ) -> list[dict[str, float | str]]:
     """
     Evaluate a MapScoreModel by calling ``model.sample(...)``.
@@ -107,7 +108,7 @@ def evaluate_score_samples(
             ddim_steps=ddim_steps,
             t_start_frac=primary_frac,
             seed=seed,
-            use_ema=True,
+            use_ema=use_ema,
         )
         pred = out_primary["predictive_mean"]
         targets = out_primary["targets"]
@@ -129,7 +130,7 @@ def evaluate_score_samples(
                     ddim_steps=ddim_steps,
                     t_start_frac=frac,
                     seed=seed,
-                    use_ema=True,
+                    use_ema=use_ema,
                 )
 
         for i, plateifu in enumerate(plateifus):

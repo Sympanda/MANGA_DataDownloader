@@ -8,52 +8,76 @@ Examples:
   python -m manga_prep download-manga-sdss 8485-1901
   python -m manga_prep download-sdss-cutouts --workers 4
   python -m manga_prep export-pipe3d-maps --in-place --workers 8
+  python -m manga_prep export-pipe3d-phys-maps --in-place --include-derived --drpall drpall-v3_1_1.fits --workers 8
   python -m manga_prep build-index --data-root manga_sdss_fits
 """
 from __future__ import annotations
 
-import argparse
 import sys
 from typing import Callable
 
-from manga_prep.download.all_manga import main as download_all_manga
-from manga_prep.download.legacy_coadd_cutouts import main as download_legacy_coadd
-from manga_prep.download.legacy_cutouts import main as download_legacy
-from manga_prep.download.manga_sdss import main as download_manga_sdss
-from manga_prep.download.pipe3d_only import main as download_pipe3d_only
-from manga_prep.download.sdss_cutouts import main as download_sdss_cutouts
-from manga_prep.download.sdss_spectra import main as download_sdss_spectra
-from manga_prep.export.aligned_imaging import main as export_aligned_imaging
-from manga_prep.export.aperture_spectra import main as export_aperture_spectra
-from manga_prep.export.build_index import main as build_index
-from manga_prep.export.compute_input_scales import main as compute_input_scales
-from manga_prep.export.inventory import main as inventory
-from manga_prep.export.manga_spectra import main as export_manga_spectra
-from manga_prep.export.pipe3d_maps import main as export_pipe3d_maps
-from manga_prep.export.thin_logcube import main as thin_logcube
-from manga_prep.export.validate_sdss_cutouts import main as validate_sdss_cutouts
-from manga_prep.io.ugriz_worker import main as ugriz_worker
-
-
-COMMANDS: dict[str, tuple[Callable, str]] = {
-    "download-manga-sdss": (download_manga_sdss, "Download MaNGA FITS from SDSS SAS"),
-    "download-all-manga": (download_all_manga, "Bulk download from DRPall list"),
-    "download-pipe3d": (download_pipe3d_only, "Download Pipe3D VAC cubes only"),
-    "download-sdss-cutouts": (download_sdss_cutouts, "SDSS JPEG + ugriz FITS cutouts"),
-    "download-legacy-cutouts": (download_legacy, "Legacy Sky Viewer cutouts"),
-    "download-legacy-coadd": (download_legacy_coadd, "Legacy NERSC coadd cutouts (recommended)"),
-    "download-sdss-spectra": (download_sdss_spectra, "Nearest SDSS fiber spectrum per galaxy"),
-    "export-pipe3d-maps": (export_pipe3d_maps, "Export Amara map targets from Pipe3D"),
-    "export-aperture-spectra": (export_aperture_spectra, "Fake SDSS-like aperture spectra from LOGCUBE"),
-    "export-manga-spectra": (export_manga_spectra, "Full IFU spaxel cubes (not used by UNet)"),
-    "export-aligned-imaging": (export_aligned_imaging, "Pre-align SDSS/Legacy to Amara grid"),
-    "compute-input-scales": (compute_input_scales, "Train-split asinh soft scales for imaging + spectra"),
-    "build-index": (build_index, "Build manga_dataset_index.csv"),
-    "inventory": (inventory, "Completeness report for local galaxy folders"),
-    "validate-sdss-cutouts": (validate_sdss_cutouts, "Check ugriz FITS band shape / metadata consistency"),
-    "thin-logcube": (thin_logcube, "Strip large FITS, keep LOGCUBE only"),
-    "ugriz-worker": (ugriz_worker, "Subprocess worker for ugriz downloads (internal)"),
+# Lazy imports: some export commands pull heavy optional deps (e.g. reproject).
+COMMAND_META: dict[str, tuple[str, str]] = {
+    "download-manga-sdss": ("manga_prep.download.manga_sdss", "Download MaNGA FITS from SDSS SAS"),
+    "download-all-manga": ("manga_prep.download.all_manga", "Bulk download from DRPall list"),
+    "download-pipe3d": ("manga_prep.download.pipe3d_only", "Download Pipe3D VAC cubes only"),
+    "download-sdss-cutouts": ("manga_prep.download.sdss_cutouts", "SDSS JPEG + ugriz FITS cutouts"),
+    "download-legacy-cutouts": ("manga_prep.download.legacy_cutouts", "Legacy Sky Viewer cutouts"),
+    "download-legacy-coadd": (
+        "manga_prep.download.legacy_coadd_cutouts",
+        "Legacy NERSC coadd cutouts (recommended)",
+    ),
+    "download-sdss-spectra": (
+        "manga_prep.download.sdss_spectra",
+        "Nearest SDSS fiber spectrum per galaxy",
+    ),
+    "export-pipe3d-maps": (
+        "manga_prep.export.pipe3d_maps",
+        "Export legacy emission-line Amara maps (amara_maps.npz)",
+    ),
+    "export-pipe3d-phys-maps": (
+        "manga_prep.export.pipe3d_phys_maps",
+        "Export physical-property Pipe3D maps (amara_phys_maps.npz)",
+    ),
+    "export-pipe3d-global-flags": (
+        "manga_prep.export.pipe3d_global_flags",
+        "Export galaxy-level BPT / star-forming flags CSV",
+    ),
+    "export-aperture-spectra": (
+        "manga_prep.export.aperture_spectra",
+        "Fake SDSS-like aperture spectra from LOGCUBE",
+    ),
+    "export-manga-spectra": (
+        "manga_prep.export.manga_spectra",
+        "Full IFU spaxel cubes (not used by UNet)",
+    ),
+    "export-aligned-imaging": (
+        "manga_prep.export.aligned_imaging",
+        "Pre-align SDSS/Legacy to Amara grid",
+    ),
+    "compute-input-scales": (
+        "manga_prep.export.compute_input_scales",
+        "Train-split asinh soft scales for imaging + spectra",
+    ),
+    "build-index": ("manga_prep.export.build_index", "Build manga_dataset_index.csv"),
+    "inventory": ("manga_prep.export.inventory", "Completeness report for local galaxy folders"),
+    "validate-sdss-cutouts": (
+        "manga_prep.export.validate_sdss_cutouts",
+        "Check ugriz FITS band shape / metadata consistency",
+    ),
+    "thin-logcube": ("manga_prep.export.thin_logcube", "Strip large FITS, keep LOGCUBE only"),
+    "ugriz-worker": (
+        "manga_prep.io.ugriz_worker",
+        "Subprocess worker for ugriz downloads (internal)",
+    ),
 }
+
+
+def _load_command(module_path: str) -> Callable:
+    import importlib
+
+    module = importlib.import_module(module_path)
+    return module.main
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,16 +85,17 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         print("Commands:")
-        for name, (_, desc) in sorted(COMMANDS.items()):
+        for name, (_, desc) in sorted(COMMAND_META.items()):
             print(f"  {name:<28} {desc}")
         return 0
 
     cmd_name = argv[0]
-    if cmd_name not in COMMANDS:
+    if cmd_name not in COMMAND_META:
         print(f"Unknown command: {cmd_name!r}. Run: python -m manga_prep --help", file=sys.stderr)
         return 2
 
-    fn, _ = COMMANDS[cmd_name]
+    module_path, _ = COMMAND_META[cmd_name]
+    fn = _load_command(module_path)
     return int(fn(argv[1:]) or 0)
 
 

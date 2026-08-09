@@ -75,9 +75,43 @@ python runner_score_corrector.py --config config_score_corrector.jsonc --run-nam
 
 ---
 
-## Takeaways
+## Takeaways (initial runs — provisional)
 
-1. **Score corrector:** frozen-UNet SDEdit does not learn useful Ha residual structure on this setup.
-2. **Score generator:** fair (`t=1`) samples do not beat the UNet RMSE; low-`t` panels must not be read as photometry→map wins.
-3. Likely interpretation: most photometry-determined signal is already in the UNet mean; diffusion adds variance/texture more than a better conditional mean.
-4. Sensible next directions (not done here): keep UNet as the mean; use diffusion only for uncertainty / masked completion; or revisit with a stronger backbone / longer training before retrying score models.
+1. **Score corrector:** frozen-UNet SDEdit did not learn useful Ha residual structure on the first setup.
+2. **Score generator:** fair (`t=1`) sample-mean MSE did not beat the UNet; low-`t` panels must not be read as photometry→map wins.
+3. **Do not conclude diffusion cannot help** until the pipeline audit below is closed (EMA re-check, label-mask cond removed, tiny-set overfit tests).
+
+---
+
+## Pipeline audit (Aug 2026) — fixes landed
+
+Following an audit of the score implementation, these corrections / diagnostics were added. **Prior negative results remain provisional until overfit tests pass.**
+
+| Item | Status |
+|------|--------|
+| EMA `update_ema()` after optimizer step | Already present in `Trainer`; confirmed AMP + non-AMP. Checkpoint `best.pt` stores `_ema.*` keys. |
+| Re-eval existing ckpt with `use_ema=False` | **Confirmed major issue.** `score_gen_ha99_2` test (n=8, t=1): `use_ema=False` mean MSE ≈ **0.005** vs `use_ema=True` ≈ **0.063** (~12×). Plots: `plots/dense99/noema/` vs `.../ema/`. EMA update hook exists, but the stored/applied EMA weights are much worse than the live denoiser — treat prior EMA-on results as invalid. |
+| EMA integration test | `tests/test_map_score.py::EMAIntegrationTests` |
+| Score-norm on **label** pixels only | `compute_score_norm_stats` fixed (was footprint) |
+| Drop `label_mask` from generator/corrector cond | Default `condition_on_label_mask: false` (legacy loads omit key → keep old 7-ch cond) |
+| Cosine schedule | Already supported (`"schedule": "cosine"`) |
+| Min-SNR weighting | `use_min_snr` / `min_snr_gamma` on `MapScoreModel` |
+| Bottleneck self-attention | `use_bottleneck_attn` / `attn_heads` on `CondMapScoreUNet` |
+| Unconditional overfit | `config_score_overfit_uncond.jsonc` + `runner_score_overfit.py` |
+| Conditional 16-gal overfit | `config_score_overfit_cond.jsonc` + same runner |
+
+**Important evaluation note:** diffusion should not be judged only by sample-mean vs UNet MSE. The UNet approximates \(E[Y\mid X]\); diffusion models \(p(Y\mid X)\). Prefer coverage, power spectra, diversity, and individual samples.
+
+### Diagnostic commands
+
+```powershell
+# Existing generator ckpt: live weights vs EMA
+python runner_score_generator.py --config config_score_generator.jsonc --run-name score_gen_ha99_2 --eval-only --t-start-fracs 1.0 --max-plot 8 --no-ema
+python runner_score_generator.py --config config_score_generator.jsonc --run-name score_gen_ha99_2 --eval-only --t-start-fracs 1.0 --max-plot 8
+
+# Tiny-set overfits (must produce recognizable Ha before blaming data)
+python runner_score_overfit.py --config config_score_overfit_uncond.jsonc --run-name score_overfit_uncond --autoinc
+python runner_score_overfit.py --config config_score_overfit_cond.jsonc --run-name score_overfit_cond --autoinc
+```
+
+Extra code paths: `runner_score_overfit.py`, overfit configs above; model knobs in `src/models/map_score.py` / `map_score_wrapper.py`.

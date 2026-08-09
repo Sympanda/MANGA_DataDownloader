@@ -119,8 +119,8 @@ class GeneratorCorrectorContractTests(unittest.TestCase):
             receive_base_as_cond=False,
         )
         model.assert_generator_no_base_cond()
-        # Cond channels: ugriz(5)+fp+label = 7, no base
-        self.assertEqual(model.denoiser.cond_channels, 7)
+        # Cond channels: ugriz(5)+footprint = 6 (label_mask is loss-only, not cond)
+        self.assertEqual(model.denoiser.cond_channels, 6)
         batch = _batch()
         pred, loss = model(batch)
         self.assertTrue(torch.isfinite(loss["loss"]))
@@ -145,7 +145,7 @@ class GeneratorCorrectorContractTests(unittest.TestCase):
             num_res_blocks=1,
         )
         model.assert_corrector_has_base_cond()
-        self.assertEqual(model.denoiser.cond_channels, 8)  # + base
+        self.assertEqual(model.denoiser.cond_channels, 7)  # ugriz+fp+base
 
     def test_loss_only_on_label_mask(self) -> None:
         cfg = _Cfg()
@@ -304,6 +304,86 @@ class ScheduleTests(unittest.TestCase):
         sched = MapDiffusionSchedule(n_steps=1000)
         self.assertEqual(sched.t_from_fraction(1.0), 999)
         self.assertGreater(sched.t_from_fraction(0.5), sched.t_from_fraction(0.1))
+
+
+class EMAIntegrationTests(unittest.TestCase):
+    def test_update_ema_changes_shadows_after_step(self) -> None:
+        cfg = _Cfg()
+        norm = ScoreNormStats(mean=0.5, std=0.2)
+        model = MapScoreModel(
+            cfg,  # type: ignore[arg-type]
+            mode="generator",
+            score_norm=norm,
+            base_model=_TinyBase(),  # type: ignore[arg-type]
+            diffusion_steps=20,
+            base_channels=16,
+            channel_mults=(1, 2),
+            num_res_blocks=1,
+            receive_base_as_cond=False,
+            condition_on_label_mask=False,
+            ema_decay=0.5,
+        )
+        before = {k: v.clone() for k, v in model.ema.shadow.items()}
+        opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+        batch = _batch(b=2)
+        opt.zero_grad(set_to_none=True)
+        _, loss_dict = model(batch)
+        loss_dict["loss"].backward()
+        opt.step()
+        model.update_ema()
+        changed = False
+        for k, v in model.ema.shadow.items():
+            if not torch.allclose(v, before[k]):
+                changed = True
+                break
+        self.assertTrue(changed, "EMA shadows should move after optimizer + update_ema")
+
+    def test_generator_default_omits_label_mask_cond(self) -> None:
+        cfg = _Cfg()
+        norm = ScoreNormStats(mean=0.5, std=0.2)
+        model = MapScoreModel(
+            cfg,  # type: ignore[arg-type]
+            mode="generator",
+            score_norm=norm,
+            base_model=_TinyBase(),  # type: ignore[arg-type]
+            diffusion_steps=10,
+            base_channels=16,
+            channel_mults=(1, 2),
+            num_res_blocks=1,
+            receive_base_as_cond=False,
+            condition_on_label_mask=False,
+        )
+        # ugriz (5) + footprint (1) = 6
+        self.assertEqual(model.denoiser.cond_channels, 6)
+        batch = _batch(b=1)
+        y0, label_mask, footprint, base_ha = model._prepare_clean_map(batch)
+        cond = model._spatial_cond(
+            batch, footprint=footprint, label_mask=label_mask, base_ha=base_ha
+        )
+        self.assertEqual(cond.shape[1], 6)
+
+
+class BottleneckAttnTests(unittest.TestCase):
+    def test_bottleneck_attention_forward(self) -> None:
+        cfg = _Cfg()
+        norm = ScoreNormStats(mean=0.5, std=0.2)
+        model = MapScoreModel(
+            cfg,  # type: ignore[arg-type]
+            mode="generator",
+            score_norm=norm,
+            base_model=_TinyBase(),  # type: ignore[arg-type]
+            diffusion_steps=10,
+            base_channels=16,
+            channel_mults=(1, 2),
+            num_res_blocks=1,
+            receive_base_as_cond=False,
+            condition_on_label_mask=False,
+            use_bottleneck_attn=True,
+            attn_heads=4,
+        )
+        self.assertTrue(model.denoiser.use_bottleneck_attn)
+        _, loss = model(_batch(b=1))
+        self.assertTrue(torch.isfinite(loss["loss"]))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,12 @@ from typing import Any, Literal
 import torch
 from torch.utils.data import DataLoader
 
-from manga_prep.dataset.manga_dataset import MangaGalaxyDataset, collate_manga_batch
+from manga_prep.dataset.manga_dataset import (
+    GalaxySFFlag,
+    MangaGalaxyDataset,
+    TargetSource,
+    collate_manga_batch,
+)
 from manga_prep.io.aligned_cache import ImagingGrid
 from src.data.augmentation import AugmentConfig
 from src.data.manga_split_dataset import MangaSplitDataset
@@ -27,6 +32,18 @@ class DataConfig:
     spectrum_mode: str = "fake"  # "fake" | "real"
     spectrum_fallback: bool = True
     use_footprint_mask: bool = True
+
+    # Target maps: legacy emission-line ("amara") or physical-property ("phys").
+    target_source: TargetSource = "amara"
+    target_keys: tuple[str, ...] | None = None
+    min_snr: float | None = None
+    galaxy_sf_flag: GalaxySFFlag | None = None
+    require_sf_spaxel: bool = False
+    # Coverage-aware selection (fill first so small IFUs are not punished).
+    min_footprint_fill: float | None = None
+    min_valid_pixels: float | None = None
+    include_redshift: bool = False
+    require_redshift: bool = False
 
     # "aligned" → Amara WCS 76×76. "native" → SDSS plate scale @ 196, Amara-oriented.
     imaging_resolution: ImagingResolution = "aligned"
@@ -80,6 +97,15 @@ def build_base_dataset(cfg: DataConfig) -> MangaGalaxyDataset:
         spectrum=spectrum,
         spectrum_fallback=cfg.spectrum_fallback,
         require_all=cfg.require_all,
+        target_source=cfg.target_source,
+        target_keys=cfg.target_keys,
+        min_snr=cfg.min_snr,
+        galaxy_sf_flag=cfg.galaxy_sf_flag,
+        require_sf_spaxel=cfg.require_sf_spaxel,
+        min_footprint_fill=cfg.min_footprint_fill,
+        min_valid_pixels=cfg.min_valid_pixels,
+        include_redshift=cfg.include_redshift,
+        require_redshift=cfg.require_redshift,
         align_imaging_to_amara_grid=True,
         prefer_aligned_cache=bool(cfg.prefer_aligned_cache),
         imaging_grid=cfg.resolve_imaging_grid(),
@@ -93,11 +119,17 @@ def build_base_dataset(cfg: DataConfig) -> MangaGalaxyDataset:
 def make_manga_dataloaders(
     data_cfg: DataConfig,
     batching_cfg: dict[str, Any],
+    *,
+    base: MangaGalaxyDataset | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
     """
     Returns (dl_train, dl_val, dl_test, dl_train_no_shuffle).
+
+    Pass ``base`` to reuse an already-built (and coverage-filtered) dataset so
+    the pre-check does not run twice.
     """
-    base = build_base_dataset(data_cfg)
+    if base is None:
+        base = build_base_dataset(data_cfg)
     split_path = data_cfg.split_csv_path
 
     train_aug = AugmentConfig(

@@ -226,7 +226,7 @@ def _forward_member(
     batch: dict,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from src.models.wrapper import prepare_hr_imaging_input
+    from src.models.wrapper import prepare_hr_imaging_input, prepare_redshift_input
 
     x = prepare_imaging_input(batch, model.config).to(device)
     x_hr = prepare_hr_imaging_input(batch, model.config)
@@ -238,7 +238,12 @@ def _forward_member(
     spec = prepare_spectrum_input(batch, model.config)
     if spec is not None:
         spec = spec.to(device)
-    pred, aux = model.model(x, spectrum_flux=spec, footprint=footprint, x_hr=x_hr)
+    redshift = prepare_redshift_input(batch, model.config)
+    if redshift is not None:
+        redshift = redshift.to(device)
+    pred, aux = model.model(
+        x, spectrum_flux=spec, footprint=footprint, x_hr=x_hr, redshift=redshift
+    )
     sigma = aux.get("sigma") if isinstance(aux, dict) else None
     return pred, sigma
 

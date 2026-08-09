@@ -60,12 +60,19 @@
     "ddim_steps": 50,
     "n_samples": 4,
     // Multi-row sample panels: t=1 pure noise; t<1 = noise clean map then denoise.
-    "eval_t_start_fracs": [1.0, 0.5, 0.25, 0.1],
+    "eval_t_start_fracs": [1.0],
     "base_channels": 64,
     "channel_mults": [1, 2, 4, 4],
     "num_res_blocks": 2,
     "schedule": "linear",
-    "ema_decay": 0.9999
+    "ema_decay": 0.9999,
+    // Do not condition on Pipe3D label mask (selection/SNR leakage).
+    "condition_on_label_mask": false,
+    "unconditional": false,
+    "use_min_snr": false,
+    "min_snr_gamma": 5.0,
+    "use_bottleneck_attn": false,
+    "attn_heads": 4
   },
 
   "model": {

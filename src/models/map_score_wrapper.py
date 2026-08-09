@@ -13,7 +13,6 @@ from src.models.input_prep import (
     prepare_spectrum_input,
     prepare_targets_and_masks,
 )
-from src.models.losses import masked_mse
 from src.models.map_score import (
     CondMapScoreUNet,
     EMA,
@@ -38,12 +37,16 @@ class MapScoreModel(nn.Module):
     Modes
     -----
     generator:
-        Conditions on imaging + masks + spectrum. Never uses UNet map as network input.
-        Frozen UNet (if provided) is only used to fill missing label pixels for a finite
+        Conditions on imaging + footprint (+ optional spectrum). Never uses UNet map
+        as network input. Label masks are for loss / eval only (not conditioning),
+        unless ``condition_on_label_mask=True`` (legacy).
+        Frozen UNet (if provided) only fills missing label pixels for a finite
         training tensor; those pixels are excluded from the score loss.
     corrector:
         Also conditions on the frozen UNet mean Hα prediction.
         Sampling starts from a noised base map (SDEdit).
+    unconditional:
+        Ignore imaging/spectrum; condition on footprint only (prior sanity tests).
     """
 
     uses_batch_forward_eval = False  # must use sample()-based score evaluator
@@ -67,6 +70,12 @@ class MapScoreModel(nn.Module):
         ema_decay: float = 0.9999,
         t_start_frac: float = 0.25,
         receive_base_as_cond: bool | None = None,
+        condition_on_label_mask: bool = False,
+        unconditional: bool = False,
+        use_min_snr: bool = False,
+        min_snr_gamma: float = 5.0,
+        use_bottleneck_attn: bool = False,
+        attn_heads: int = 4,
     ) -> None:
         super().__init__()
         if config.n_target_maps != 1:
@@ -79,9 +88,15 @@ class MapScoreModel(nn.Module):
         self.ddim_steps = int(ddim_steps)
         self.n_samples = int(n_samples)
         self.t_start_frac = float(t_start_frac)
+        self.condition_on_label_mask = bool(condition_on_label_mask)
+        self.unconditional = bool(unconditional)
+        self.use_min_snr = bool(use_min_snr)
+        self.min_snr_gamma = float(min_snr_gamma)
         self.receive_base_as_cond = (
             (mode == "corrector") if receive_base_as_cond is None else bool(receive_base_as_cond)
         )
+        if self.unconditional:
+            self.receive_base_as_cond = False
 
         self.base_model = base_model
         if self.base_model is not None:
@@ -91,10 +106,19 @@ class MapScoreModel(nn.Module):
         if self.receive_base_as_cond and self.base_model is None:
             raise ValueError("Corrector mode requires a frozen base_model")
 
-        # Spatial cond: ugriz + footprint + label_mask [+ optional base map]
-        cond_ch = config.imaging_input_channels() + 2
-        if self.receive_base_as_cond:
-            cond_ch += 1
+        # Spatial cond:
+        #   unconditional → footprint only
+        #   else → ugriz + footprint [+ optional label_mask] [+ optional base]
+        if self.unconditional:
+            cond_ch = 1
+            use_spectrum = False
+        else:
+            cond_ch = config.imaging_input_channels() + 1  # + footprint
+            if self.condition_on_label_mask:
+                cond_ch += 1
+            if self.receive_base_as_cond:
+                cond_ch += 1
+            use_spectrum = bool(config.use_spectrum)
 
         self.denoiser = CondMapScoreUNet(
             cond_channels=cond_ch,
@@ -102,11 +126,13 @@ class MapScoreModel(nn.Module):
             base_channels=base_channels,
             channel_mults=channel_mults,
             num_res_blocks=num_res_blocks,
-            use_spectrum=bool(config.use_spectrum),
+            use_spectrum=use_spectrum,
             spectrum_n_wave=config.spectrum_n_wave,
-            spectrum_in_channels=config.spectrum_input_channels() if config.use_spectrum else 1,
+            spectrum_in_channels=config.spectrum_input_channels() if use_spectrum else 1,
             spectrum_pooling=config.spectrum_pooling,
             cond_dim=config.cond_dim,
+            use_bottleneck_attn=use_bottleneck_attn,
+            attn_heads=attn_heads,
         )
         self.schedule = MapDiffusionSchedule(n_steps=diffusion_steps, schedule=schedule)
         self.ema = EMA(self.denoiser, decay=ema_decay)
@@ -227,13 +253,25 @@ class MapScoreModel(nn.Module):
         label_mask: torch.Tensor,
         base_ha: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.unconditional:
+            return footprint
         x = prepare_imaging_input(batch, self.config)
-        parts = [x, footprint, label_mask]
+        parts = [x, footprint]
+        if self.condition_on_label_mask:
+            parts.append(label_mask)
         if self.receive_base_as_cond:
             if base_ha is None:
                 raise RuntimeError("Corrector conditioning requires base_ha")
             parts.append(self.score_norm.normalize(base_ha) * footprint)
         return torch.cat(parts, dim=1)
+
+    def _min_snr_weights(self, t: torch.Tensor) -> torch.Tensor:
+        """Per-sample Min-SNR-γ weights for epsilon MSE (Hang et al.)."""
+        a = self.schedule.register["alphas_cumprod"][t].clamp(min=1e-8, max=1.0 - 1e-8)
+        snr = a / (1.0 - a)
+        # weight = min(snr, γ) / snr  for epsilon parameterisation
+        w = torch.minimum(snr, snr.new_tensor(self.min_snr_gamma)) / snr
+        return w.view(-1, 1, 1, 1)
 
     def forward(
         self,
@@ -246,7 +284,7 @@ class MapScoreModel(nn.Module):
         cond = self._spatial_cond(
             batch, footprint=footprint, label_mask=label_mask, base_ha=base_ha
         )
-        spec = prepare_spectrum_input(batch, self.config)
+        spec = None if self.unconditional else prepare_spectrum_input(batch, self.config)
         self._move_schedule(y0.device)
 
         b = y0.shape[0]
@@ -258,7 +296,12 @@ class MapScoreModel(nn.Module):
 
         pred_noise = self.denoiser(noisy, t, cond, spectrum=spec)
         # Score / epsilon loss only on reliable labels.
-        loss = masked_mse(pred_noise.float(), noise.float(), label_mask.float())
+        err = (pred_noise.float() - noise.float()) ** 2
+        m = label_mask.float()
+        if self.use_min_snr:
+            err = err * self._min_snr_weights(t)
+        denom = m.sum().clamp_min(1.0)
+        loss = (err * m).sum() / denom
 
         # Training-view x0 estimate (not a reverse-process sample).
         a = self.schedule.register["sqrt_alphas_cumprod"][t].view(-1, 1, 1, 1)
@@ -299,14 +342,18 @@ class MapScoreModel(nn.Module):
         eta: float = 0.0,
         t_start_frac: float | None = None,
         seed: int | None = None,
-        use_ema: bool = True,
+        use_ema: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Run reverse-process sampling and return maps in scaled target space."""
+        """Run reverse-process sampling and return maps in scaled target space.
+
+        Default ``use_ema=False`` until EMA shadows are trusted (live weights have
+        been much better on existing checkpoints).
+        """
         y0, label_mask, footprint, base_ha = self._prepare_clean_map(batch)
         cond = self._spatial_cond(
             batch, footprint=footprint, label_mask=label_mask, base_ha=base_ha
         )
-        spec = prepare_spectrum_input(batch, self.config)
+        spec = None if self.unconditional else prepare_spectrum_input(batch, self.config)
         self._move_schedule(cond.device)
 
         n = int(n_samples or self.n_samples)
@@ -316,6 +363,13 @@ class MapScoreModel(nn.Module):
             frac = None if self.mode == "generator" else float(self.t_start_frac)
         else:
             frac = float(t_start_frac)
+
+        # Clip predicted x0 to a generous range covering scaled maps in [0, 1].
+        sn = self.score_norm
+        margin = 4.0
+        x0_lo = (0.0 - sn.mean) / max(sn.std, 1e-6) - margin
+        x0_hi = (1.0 - sn.mean) / max(sn.std, 1e-6) + margin
+        x0_clip = (float(x0_lo), float(x0_hi))
 
         backup = None
         if use_ema and self.ema.shadow:
@@ -344,6 +398,7 @@ class MapScoreModel(nn.Module):
                         x_init=x_init,
                         t_start=t_start,
                         spectrum=spec,
+                        x0_clip=x0_clip,
                     )
                 else:
                     # Direct generator:
@@ -360,6 +415,7 @@ class MapScoreModel(nn.Module):
                             x_init=None,
                             t_start=None,
                             spectrum=spec,
+                            x0_clip=x0_clip,
                         )
                     else:
                         t_start = self.schedule.t_from_fraction(frac)
@@ -373,6 +429,7 @@ class MapScoreModel(nn.Module):
                             x_init=y0,
                             t_start=t_start,
                             spectrum=spec,
+                            x0_clip=x0_clip,
                         )
                 samples_score.append(y_k)
         finally:
@@ -381,8 +438,8 @@ class MapScoreModel(nn.Module):
 
         stack_score = torch.stack(samples_score, dim=0)
         stack = self.score_norm.denormalize(stack_score)
-        # Keep samples on footprint domain.
-        stack = stack * footprint.unsqueeze(0)
+        # Keep samples on footprint domain; soft-clamp to physical [0, 1] display range.
+        stack = (stack * footprint.unsqueeze(0)).clamp(0.0, 1.0)
 
         targets, _ = prepare_targets_and_masks(batch, self.config)
         mean = stack.mean(dim=0)
@@ -408,6 +465,97 @@ class MapScoreModel(nn.Module):
             out["base_maps"] = base_ha
             out["residual_target"] = targets - base_ha
             out["residual_prediction"] = mean - base_ha
+        return out
+
+    @torch.no_grad()
+    def sample_inpaint(
+        self,
+        batch: dict[str, object],
+        *,
+        known_mask: torch.Tensor,
+        n_samples: int | None = None,
+        ddim_steps: int | None = None,
+        eta: float = 0.0,
+        seed: int | None = None,
+        use_ema: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """
+        RePaint inpainting in score space.
+
+        ``known_mask`` (B,1,H,W or B,H,W): pixels whose **true** Ha is kept and
+        re-injected each reverse step. Free pixels are generated. Conditioning
+        uses this known mask when ``condition_on_label_mask`` is enabled (legacy).
+        """
+        _, full_label, footprint, base_ha = self._prepare_clean_map(batch)
+        targets, _ = prepare_targets_and_masks(batch, self.config)
+        # Clean map for RePaint: true labels in score space (known pixels re-injected).
+        y_true = self.score_norm.normalize(targets) * footprint
+        if known_mask.ndim == 3:
+            known_mask = known_mask.unsqueeze(1)
+        known_mask = known_mask.to(device=footprint.device, dtype=footprint.dtype)
+        known_mask = known_mask * (full_label > 0).to(dtype=footprint.dtype) * footprint
+
+        cond = self._spatial_cond(
+            batch, footprint=footprint, label_mask=known_mask, base_ha=base_ha
+        )
+        spec = None if self.unconditional else prepare_spectrum_input(batch, self.config)
+        self._move_schedule(cond.device)
+
+        n = int(n_samples or self.n_samples)
+        steps = int(ddim_steps or self.ddim_steps)
+        sn = self.score_norm
+        margin = 4.0
+        x0_clip = (
+            (0.0 - sn.mean) / max(sn.std, 1e-6) - margin,
+            (1.0 - sn.mean) / max(sn.std, 1e-6) + margin,
+        )
+
+        backup = None
+        if use_ema and self.ema.shadow:
+            backup = {k: v.detach().clone() for k, v in self.denoiser.state_dict().items()}
+            self.ema.copy_to(self.denoiser)
+
+        samples_score = []
+        try:
+            for k in range(n):
+                gen = None
+                if seed is not None:
+                    gen = torch.Generator(device=cond.device)
+                    gen.manual_seed(int(seed) + k)
+                y_k = self.schedule.ddim_inpaint(
+                    self.denoiser,
+                    cond,
+                    y0=y_true,
+                    known_mask=known_mask,
+                    steps=steps,
+                    eta=eta,
+                    generator=gen,
+                    footprint_mask=footprint,
+                    spectrum=spec,
+                    x0_clip=x0_clip,
+                )
+                samples_score.append(y_k)
+        finally:
+            if backup is not None:
+                self.denoiser.load_state_dict(backup, strict=False)
+
+        stack = self.score_norm.denormalize(torch.stack(samples_score, dim=0))
+        stack = (stack * footprint.unsqueeze(0)).clamp(0.0, 1.0)
+        mean = stack.mean(dim=0)
+        out: dict[str, torch.Tensor] = {
+            "maps": mean,
+            "samples": stack,
+            "predictive_mean": mean,
+            "predictive_std": stack.std(dim=0, unbiased=False),
+            "targets": targets,
+            "masks": full_label,
+            "label_mask": full_label,
+            "known_mask": known_mask,
+            "heldout_mask": (full_label > 0).to(dtype=footprint.dtype) * (1.0 - known_mask) * footprint,
+            "footprint_mask": footprint,
+        }
+        if base_ha is not None:
+            out["base_maps"] = base_ha
         return out
 
     def assert_generator_no_base_cond(self) -> None:
